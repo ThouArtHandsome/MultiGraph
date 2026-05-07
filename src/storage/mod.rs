@@ -13,4 +13,4 @@
 pub mod cache;
 pub mod distributed;
 pub mod rocks;
-pub mod traits;
+pub mod graph_store;

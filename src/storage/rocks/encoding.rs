@@ -196,7 +196,7 @@ mod tests {
     use super::{decode_edge_key, encode_edge_key, EdgeValue, VertexKey, VertexValue};
     use crate::types::{
         element::{Direction, EdgeKey},
-        full::{FullEdge, FullElement, FullVertex},
+        full_element::{FullEdge, FullElement, FullVertex},
         gvalue::{GValue, Primitive, Property},
         prop_key::PropKey,
     };

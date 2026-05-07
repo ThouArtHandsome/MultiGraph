@@ -11,8 +11,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 pub mod encoding;
-pub mod engine;
+pub mod graph;
+pub mod store;
 
 pub use encoding::{
-    decode_edge_key, encode_edge_key, EdgeValue, VertexKey, VertexValue, CF_EDGES_IN, CF_EDGES_OUT, CF_VERTICES,
+    decode_edge_key, encode_edge_key, EdgeValue, VertexKey, VertexValue, CF_EDGES_IN, CF_EDGES_OUT,
+    CF_VERTICES,
 };
+pub use store::RocksStorage;

@@ -26,3 +26,6 @@
 
     # Inline vec for Traverser labels: stack-allocates ≤2 label strings with no heap
     smallvec = "1"
+
+    # RocksDB storage backend
+    rocksdb = "0.22"

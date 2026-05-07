@@ -19,7 +19,7 @@ use indexmap::IndexMap;
 use smol_str::SmolStr;
 
 use crate::types::{
-    full::{FullEdge, FullElement, FullVertex},
+    full_element::{FullEdge, FullElement, FullVertex},
     prop_key::PropKey,
 };
 
