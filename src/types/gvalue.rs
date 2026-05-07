@@ -82,12 +82,12 @@ impl Hash for Primitive {
 
 /// A single property value together with its owning element.
 ///
-/// Stored in `Arc<Vec<Property>>` inside `FullVertex`/`FullEdge`.
+/// Stored in `Vec<Property>` inside `FullVertex`/`FullEdge`.
 ///
 /// `owner` is a `Weak<FullElement>` back-pointer so the property can reach
 /// the ground-truth element without a cache look-up.  `Weak` (not `Arc`)
 /// breaks the reference cycle: `Arc<FullElement>` → `Arc<FullVertex/FullEdge>`
-/// → `Arc<Vec<Property>>` → `Property` → back to `Arc<FullElement>`.
+/// → `Vec<Property>` → `Property` → back to `Arc<FullElement>`.
 /// Construct via `Arc::new_cyclic`.
 #[derive(Debug, Clone)]
 pub struct Property {

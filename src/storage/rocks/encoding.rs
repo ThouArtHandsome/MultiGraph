@@ -318,11 +318,10 @@ mod tests {
         let label = SmolStr::new(label);
         let raw = raw.to_vec();
         Arc::new_cyclic(|weak| {
-            let props = Arc::new(
-                raw.iter()
-                    .map(|(k, v)| Property { owner: weak.clone(), key: k.clone(), value: v.clone() })
-                    .collect::<Vec<_>>(),
-            );
+            let props = raw
+                .iter()
+                .map(|(k, v)| Property { owner: weak.clone(), key: k.clone(), value: v.clone() })
+                .collect();
             FullElement::Vertex(Arc::new(FullVertex { id, label, props }))
         })
     }
@@ -330,11 +329,10 @@ mod tests {
     fn make_full_edge(key: EdgeKey, raw: &[(PropKey, Primitive)]) -> Arc<FullElement> {
         let raw = raw.to_vec();
         Arc::new_cyclic(|weak| {
-            let props = Arc::new(
-                raw.iter()
-                    .map(|(k, v)| Property { owner: weak.clone(), key: k.clone(), value: v.clone() })
-                    .collect::<Vec<_>>(),
-            );
+            let props = raw
+                .iter()
+                .map(|(k, v)| Property { owner: weak.clone(), key: k.clone(), value: v.clone() })
+                .collect();
             FullElement::Edge(Arc::new(FullEdge { key, props }))
         })
     }

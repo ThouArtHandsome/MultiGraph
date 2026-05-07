@@ -23,24 +23,21 @@ use crate::types::gvalue::Property;
 ///
 /// Lives in the `Transaction::read_buffer` (per-query) and/or the
 /// `SharedStoreCache` (process-wide).  Never mutated after insertion.
-///
-/// `props` is an `Arc` so that `GValue::Vertex` handles created from this
-/// record share the same property bag without copying it.
 #[derive(Debug, Clone)]
 pub struct FullVertex {
     pub id: VertexKey,
     pub label: SmolStr,
-    pub props: Arc<Vec<Property>>,
+    pub props: Vec<Property>,
 }
 
 /// The single authoritative in-process copy of an edge's committed state.
 ///
-/// Same sharing semantics as `FullVertex`.  `key` is in canonical (`Out`)
-/// direction — the `In` view is derived on demand via `EdgeKey::flip`.
+/// `key` is in canonical (`Out`) direction — the `In` view is derived on
+/// demand via `EdgeKey::flip`.
 #[derive(Debug, Clone)]
 pub struct FullEdge {
     pub key: EdgeKey,
-    pub props: Arc<Vec<Property>>,
+    pub props: Vec<Property>,
 }
 
 // ── FullElement ───────────────────────────────────────────────────────────────
