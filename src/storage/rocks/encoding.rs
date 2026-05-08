@@ -50,7 +50,7 @@
 //! EdgeValue   : [ property_blob ]
 //! ```
 
-use crate::types::{Direction, EdgeKey, LabelId, Rank};
+use crate::types::{Direction, EdgeKey, LabelId, Rank, VertexKey};
 
 // ── Column-family name constants ──────────────────────────────────────────────
 
@@ -83,21 +83,16 @@ fn direction_from_byte(b: u8) -> Option<Direction> {
     }
 }
 
-// ── VertexKey ─────────────────────────────────────────────────────────────────
+// ── VertexKey encoding ────────────────────────────────────────────────────────
 
-/// `[ VertexKey:u64 ]` — key for the `vertices` CF.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VertexKey(pub u64);
+/// Encode a `VertexKey` to its 8-byte big-endian on-disk representation.
+pub fn encode_vertex_key(key: VertexKey) -> [u8; VERTEX_KEY_SIZE] {
+    key.to_be_bytes()
+}
 
-impl VertexKey {
-    pub fn encode(self) -> [u8; VERTEX_KEY_SIZE] {
-        self.0.to_be_bytes()
-    }
-
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let arr: [u8; 8] = bytes.try_into().ok()?;
-        Some(Self(u64::from_be_bytes(arr)))
-    }
+/// Decode an 8-byte slice into a `VertexKey`.
+pub fn decode_vertex_key(bytes: &[u8]) -> Option<VertexKey> {
+    Some(u64::from_be_bytes(bytes.try_into().ok()?))
 }
 
 // ── EdgeKey encoding ──────────────────────────────────────────────────────────
@@ -193,7 +188,7 @@ mod tests {
 
     use smol_str::SmolStr;
 
-    use super::{decode_edge_key, encode_edge_key, EdgeValue, VertexKey, VertexValue};
+    use super::{decode_edge_key, decode_vertex_key, encode_edge_key, encode_vertex_key, EdgeValue, VertexValue};
     use crate::types::{
         element::{Direction, EdgeKey},
         full_element::{FullEdge, FullElement, FullVertex},
@@ -341,15 +336,15 @@ mod tests {
 
     #[test]
     fn vertex_key_encode_decode() {
-        let original = VertexKey(42);
-        let decoded = VertexKey::decode(&original.encode()).unwrap();
+        let original: u64 = 42;
+        let decoded = decode_vertex_key(&encode_vertex_key(original)).unwrap();
         assert_eq!(original, decoded);
     }
 
     #[test]
     fn vertex_key_decode_bad_length() {
-        assert!(VertexKey::decode(&[0u8; 4]).is_none());
-        assert!(VertexKey::decode(&[]).is_none());
+        assert!(decode_vertex_key(&[0u8; 4]).is_none());
+        assert!(decode_vertex_key(&[]).is_none());
     }
 
     // ── EdgeKey tests ─────────────────────────────────────────────────────────
@@ -391,13 +386,13 @@ mod tests {
         ];
 
         // Encode to key bytes + value bytes.
-        let key_bytes = VertexKey(vid).encode();
+        let key_bytes = encode_vertex_key(vid);
         let val_bytes = VertexValue { label: "person".into(), property_blob: encode_props(&raw_props) }.encode();
 
         // Decode back.
-        let dec_key = VertexKey::decode(&key_bytes).unwrap();
+        let dec_key = decode_vertex_key(&key_bytes).unwrap();
         let dec_vv = VertexValue::decode(&val_bytes).unwrap();
-        assert_eq!(dec_key.0, vid);
+        assert_eq!(dec_key, vid);
         assert_eq!(dec_vv.label, "person");
 
         let dec_props = decode_props(&dec_vv.property_blob);
@@ -408,7 +403,7 @@ mod tests {
         }
 
         // Reconstruct FullVertex.
-        let full_elem = make_full_vertex(dec_key.0, &dec_vv.label, &dec_props);
+        let full_elem = make_full_vertex(dec_key, &dec_vv.label, &dec_props);
         let FullElement::Vertex(ref fv) = *full_elem else { panic!("expected Vertex") };
         assert_eq!(fv.id, vid);
         assert_eq!(fv.label.as_str(), "person");

@@ -42,6 +42,16 @@ pub trait GraphWriter {
     fn insert_vertices(&mut self, vertices: &[FullVertex]) -> Result<(), StorageError>;
 
     /// Persist a batch of edges; any pre-existing edge with the same key is overwritten.
+    ///
+    /// Implementors **must** write each logical edge in both traversal directions so
+    /// that `get_edges` with `Direction::OUT` and `Direction::IN` both work without
+    /// cross-direction lookups:
+    ///
+    /// - the canonical `OUT` form (primary = src) is written to the outgoing index.
+    /// - the flipped `IN` form (primary = dst) is written to the incoming index.
+    ///
+    /// Callers supply edges in any direction; the implementation is responsible for
+    /// canonicalising and deriving the reverse entry.
     fn insert_edges(&mut self, edges: &[FullEdge]) -> Result<(), StorageError>;
 }
 

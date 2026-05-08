@@ -19,8 +19,8 @@ use rocksdb::{Direction as ScanDir, IteratorMode, ReadOptions, WriteBatch};
 use smol_str::SmolStr;
 
 use crate::storage::rocks::encoding::{
-    decode_edge_key, encode_edge_key, EdgeValue, VertexKey as RocksVKey, VertexValue, CF_EDGES_IN,
-    CF_EDGES_OUT, CF_VERTICES,
+    decode_edge_key, encode_edge_key, encode_vertex_key, EdgeValue, VertexValue,
+    CF_EDGES_IN, CF_EDGES_OUT, CF_VERTICES,
 };
 use crate::storage::rocks::store::RocksStorage;
 use crate::storage::graph_store::{GraphReader, GraphStorage, GraphWriter};
@@ -242,7 +242,7 @@ impl GraphReader for RocksStorage {
             .ok_or_else(|| StorageError::Other("missing CF: vertices".into()))?;
         match self
             .db
-            .get_cf(&cf, RocksVKey(key).encode())
+            .get_cf(&cf, encode_vertex_key(key))
             .map_err(|e| StorageError::Other(e.to_string()))?
         {
             None => Ok(None),
@@ -263,7 +263,7 @@ impl GraphReader for RocksStorage {
         for &key in keys {
             match self
                 .db
-                .get_cf(&cf, RocksVKey(key).encode())
+                .get_cf(&cf, encode_vertex_key(key))
                 .map_err(|e| StorageError::Other(e.to_string()))?
             {
                 None => {}
@@ -343,7 +343,7 @@ impl GraphWriter for RocksStorage {
                 label: fv.label.to_string(),
                 property_blob: encode_props(&fv.props),
             };
-            batch.put_cf(&cf, RocksVKey(fv.id).encode(), vv.encode());
+            batch.put_cf(&cf, encode_vertex_key(fv.id), vv.encode());
         }
         self.db.write(batch).map_err(|e| StorageError::Other(e.to_string()))
     }
