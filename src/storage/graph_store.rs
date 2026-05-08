@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use crate::types::{Direction, FullEdge, FullVertex, LabelId, StorageError, VertexKey};
+use crate::types::{Direction, EdgeKey, FullEdge, FullVertex, LabelId, StorageError, VertexKey};
 
 /// Read-only access to the graph store.
 pub trait GraphReader {
@@ -21,6 +21,10 @@ pub trait GraphReader {
 
     /// Fetch multiple vertices by their keys; missing keys are silently omitted from the result.
     fn get_vertices(&self, keys: &[VertexKey]) -> Result<Vec<Arc<FullVertex>>, StorageError>;
+
+    /// Fetch a single edge by its canonical (`Out`-direction) key.
+    /// Returns `None` if not found.
+    fn get_edge(&self, key: EdgeKey) -> Result<Option<Arc<FullEdge>>, StorageError>;
 
     /// Fetch all edges incident to `vertex` in the given `direction`.
     ///
@@ -53,6 +57,14 @@ pub trait GraphWriter {
     /// Callers supply edges in any direction; the implementation is responsible for
     /// canonicalising and deriving the reverse entry.
     fn insert_edges(&mut self, edges: &[FullEdge]) -> Result<(), StorageError>;
+
+    /// Delete a vertex by key.  A no-op if the vertex does not exist.
+    fn delete_vertex(&mut self, key: VertexKey) -> Result<(), StorageError>;
+
+    /// Delete an edge by its canonical (`Out`-direction) key.
+    /// Removes entries from both the outgoing and incoming indices.
+    /// A no-op if the edge does not exist.
+    fn delete_edge(&mut self, key: EdgeKey) -> Result<(), StorageError>;
 }
 
 /// Combined read + write access; blanket-implemented for any type that satisfies both.

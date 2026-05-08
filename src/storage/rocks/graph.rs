@@ -235,6 +235,25 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 // ── GraphReader ───────────────────────────────────────────────────────────────
 
 impl GraphReader for RocksStorage {
+    fn get_edge(&self, key: EdgeKey) -> Result<Option<Arc<FullEdge>>, StorageError> {
+        let cf = self
+            .db
+            .cf_handle(CF_EDGES_OUT)
+            .ok_or_else(|| StorageError::Other("missing CF: edges_out".into()))?;
+        let canonical = key.canonical();
+        match self
+            .db
+            .get_cf(&cf, encode_edge_key(canonical))
+            .map_err(|e| StorageError::Other(e.to_string()))?
+        {
+            None => Ok(None),
+            Some(raw) => {
+                let ev = EdgeValue::decode(&raw);
+                Ok(Some(build_full_edge(canonical, &ev)?))
+            }
+        }
+    }
+
     fn get_vertex(&self, key: VertexKey) -> Result<Option<Arc<FullVertex>>, StorageError> {
         let cf = self
             .db
@@ -348,6 +367,32 @@ impl GraphWriter for RocksStorage {
         self.db.write(batch).map_err(|e| StorageError::Other(e.to_string()))
     }
 
+    fn delete_vertex(&mut self, key: VertexKey) -> Result<(), StorageError> {
+        let cf = self
+            .db
+            .cf_handle(CF_VERTICES)
+            .ok_or_else(|| StorageError::Other("missing CF: vertices".into()))?;
+        self.db
+            .delete_cf(&cf, encode_vertex_key(key))
+            .map_err(|e| StorageError::Other(e.to_string()))
+    }
+
+    fn delete_edge(&mut self, key: EdgeKey) -> Result<(), StorageError> {
+        let cf_out = self
+            .db
+            .cf_handle(CF_EDGES_OUT)
+            .ok_or_else(|| StorageError::Other("missing CF: edges_out".into()))?;
+        let cf_in = self
+            .db
+            .cf_handle(CF_EDGES_IN)
+            .ok_or_else(|| StorageError::Other("missing CF: edges_in".into()))?;
+        let canonical = key.canonical();
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(&cf_out, encode_edge_key(canonical));
+        batch.delete_cf(&cf_in, encode_edge_key(canonical.flip()));
+        self.db.write(batch).map_err(|e| StorageError::Other(e.to_string()))
+    }
+
     fn insert_edges(&mut self, edges: &[FullEdge]) -> Result<(), StorageError> {
         let cf_out = self
             .db
@@ -371,3 +416,264 @@ impl GraphWriter for RocksStorage {
 }
 
 impl GraphStorage for RocksStorage {}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Weak;
+
+    use smol_str::SmolStr;
+
+    use crate::storage::graph_store::{GraphReader, GraphWriter};
+    use crate::storage::rocks::store::RocksStorage;
+    use crate::types::gvalue::{Primitive, Property};
+    use crate::types::prop_key::PropKey;
+    use crate::types::{Direction, EdgeKey, FullEdge, FullElement, FullVertex};
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn open_temp_store() -> (RocksStorage, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RocksStorage::open(dir.path()).unwrap();
+        (store, dir)
+    }
+
+    fn make_vertex(id: u64, label: &str, props: Vec<(PropKey, Primitive)>) -> FullVertex {
+        FullVertex {
+            id,
+            label: SmolStr::new(label),
+            props: props
+                .into_iter()
+                .map(|(k, v)| Property { owner: Weak::<FullElement>::new(), key: k, value: v })
+                .collect(),
+        }
+    }
+
+    fn make_edge(key: EdgeKey, props: Vec<(PropKey, Primitive)>) -> FullEdge {
+        FullEdge {
+            key,
+            props: props
+                .into_iter()
+                .map(|(k, v)| Property { owner: Weak::<FullElement>::new(), key: k, value: v })
+                .collect(),
+        }
+    }
+
+    // ── insert_vertices / get_vertex ──────────────────────────────────────────
+
+    #[test]
+    fn insert_and_get_single_vertex() {
+        let (mut store, _dir) = open_temp_store();
+        let v = make_vertex(
+            1,
+            "person",
+            vec![
+                (PropKey::new("name"), Primitive::String(SmolStr::new("Alice"))),
+                (PropKey::new("age"), Primitive::Int32(30)),
+            ],
+        );
+        store.insert_vertices(&[v]).unwrap();
+
+        let fv = store.get_vertex(1).unwrap().unwrap();
+        assert_eq!(fv.id, 1);
+        assert_eq!(fv.label.as_str(), "person");
+        assert_eq!(fv.props.len(), 2);
+        assert_eq!(fv.props[0].key, PropKey::new("name"));
+        assert_eq!(fv.props[0].value, Primitive::String(SmolStr::new("Alice")));
+        assert_eq!(fv.props[1].key, PropKey::new("age"));
+        assert_eq!(fv.props[1].value, Primitive::Int32(30));
+    }
+
+    #[test]
+    fn get_vertex_not_found_returns_none() {
+        let (store, _dir) = open_temp_store();
+        assert!(store.get_vertex(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn insert_vertex_with_no_props() {
+        let (mut store, _dir) = open_temp_store();
+        store.insert_vertices(&[make_vertex(42, "empty", vec![])]).unwrap();
+
+        let fv = store.get_vertex(42).unwrap().unwrap();
+        assert_eq!(fv.label.as_str(), "empty");
+        assert!(fv.props.is_empty());
+    }
+
+    #[test]
+    fn insert_vertex_overwrite_updates_value() {
+        let (mut store, _dir) = open_temp_store();
+        store
+            .insert_vertices(&[make_vertex(1, "person", vec![(PropKey::new("age"), Primitive::Int32(20))])])
+            .unwrap();
+
+        store
+            .insert_vertices(&[make_vertex(1, "admin", vec![(PropKey::new("age"), Primitive::Int32(99))])])
+            .unwrap();
+
+        let fv = store.get_vertex(1).unwrap().unwrap();
+        assert_eq!(fv.label.as_str(), "admin");
+        assert_eq!(fv.props[0].value, Primitive::Int32(99));
+    }
+
+    // ── get_vertices ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn get_vertices_returns_all_inserted() {
+        let (mut store, _dir) = open_temp_store();
+        let vertices = vec![
+            make_vertex(1, "person", vec![(PropKey::new("name"), Primitive::String(SmolStr::new("Alice")))]),
+            make_vertex(2, "person", vec![(PropKey::new("name"), Primitive::String(SmolStr::new("Bob")))]),
+            make_vertex(3, "company", vec![(PropKey::new("name"), Primitive::String(SmolStr::new("Acme")))]),
+        ];
+        store.insert_vertices(&vertices).unwrap();
+
+        let results = store.get_vertices(&[1, 2, 3]).unwrap();
+        assert_eq!(results.len(), 3);
+
+        let mut ids: Vec<u64> = results.iter().map(|v| v.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn get_vertices_silently_omits_missing_keys() {
+        let (mut store, _dir) = open_temp_store();
+        store.insert_vertices(&[make_vertex(10, "node", vec![])]).unwrap();
+
+        let results = store.get_vertices(&[10, 20, 30]).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 10);
+    }
+
+    #[test]
+    fn get_vertices_all_missing_returns_empty() {
+        let (store, _dir) = open_temp_store();
+        assert!(store.get_vertices(&[1, 2, 3]).unwrap().is_empty());
+    }
+
+    // ── insert_edges / get_edges ──────────────────────────────────────────────
+
+    #[test]
+    fn insert_edge_readable_in_out_direction() {
+        let (mut store, _dir) = open_temp_store();
+        store
+            .insert_edges(&[make_edge(
+                EdgeKey::out_e(1, 5, 2, 0),
+                vec![(PropKey::new("weight"), Primitive::Float64(1.5))],
+            )])
+            .unwrap();
+
+        let edges = store.get_edges(1, Direction::OUT, None, None).unwrap();
+        assert_eq!(edges.len(), 1);
+        let fe = &edges[0];
+        assert_eq!(fe.key.primary_id, 1);
+        assert_eq!(fe.key.secondary_id, 2);
+        assert_eq!(fe.key.label_id, 5);
+        assert_eq!(fe.key.direction, Direction::OUT);
+        assert_eq!(fe.props.len(), 1);
+        assert_eq!(fe.props[0].key, PropKey::new("weight"));
+        assert_eq!(fe.props[0].value, Primitive::Float64(1.5));
+    }
+
+    #[test]
+    fn insert_edge_readable_in_in_direction() {
+        let (mut store, _dir) = open_temp_store();
+        // Edge: src=1 → dst=2, label=5
+        store
+            .insert_edges(&[make_edge(EdgeKey::out_e(1, 5, 2, 0), vec![])])
+            .unwrap();
+
+        // Query from dst vertex with Direction::IN
+        let edges = store.get_edges(2, Direction::IN, None, None).unwrap();
+        assert_eq!(edges.len(), 1);
+        let fe = &edges[0];
+        assert_eq!(fe.key.primary_id, 2);   // dst is primary for IN view
+        assert_eq!(fe.key.secondary_id, 1); // src is secondary for IN view
+        assert_eq!(fe.key.label_id, 5);
+        assert_eq!(fe.key.direction, Direction::IN);
+    }
+
+    #[test]
+    fn insert_edge_supplied_as_in_key_writes_both_directions() {
+        let (mut store, _dir) = open_temp_store();
+        // in_e(src=1, label=5, dst=2) — caller supplies an IN-direction key
+        store
+            .insert_edges(&[make_edge(EdgeKey::in_e(1, 5, 2, 0), vec![])])
+            .unwrap();
+
+        // Both OUT and IN scans must find exactly one edge
+        let out_edges = store.get_edges(1, Direction::OUT, None, None).unwrap();
+        assert_eq!(out_edges.len(), 1);
+        assert_eq!(out_edges[0].key, EdgeKey::out_e(1, 5, 2, 0));
+
+        let in_edges = store.get_edges(2, Direction::IN, None, None).unwrap();
+        assert_eq!(in_edges.len(), 1);
+        assert_eq!(in_edges[0].key, EdgeKey::in_e(1, 5, 2, 0));
+    }
+
+    #[test]
+    fn get_edges_filter_by_label() {
+        let (mut store, _dir) = open_temp_store();
+        store
+            .insert_edges(&[
+                make_edge(EdgeKey::out_e(1, 1, 10, 0), vec![]),
+                make_edge(EdgeKey::out_e(1, 2, 20, 0), vec![]),
+                make_edge(EdgeKey::out_e(1, 1, 30, 0), vec![]),
+            ])
+            .unwrap();
+
+        let label1 = store.get_edges(1, Direction::OUT, Some(1), None).unwrap();
+        assert_eq!(label1.len(), 2);
+        assert!(label1.iter().all(|e| e.key.label_id == 1));
+
+        let label2 = store.get_edges(1, Direction::OUT, Some(2), None).unwrap();
+        assert_eq!(label2.len(), 1);
+        assert_eq!(label2[0].key.secondary_id, 20);
+    }
+
+    #[test]
+    fn get_edges_filter_by_dst() {
+        let (mut store, _dir) = open_temp_store();
+        store
+            .insert_edges(&[
+                make_edge(EdgeKey::out_e(1, 1, 10, 0), vec![]),
+                make_edge(EdgeKey::out_e(1, 1, 20, 0), vec![]),
+                make_edge(EdgeKey::out_e(1, 1, 30, 0), vec![]),
+            ])
+            .unwrap();
+
+        let result = store.get_edges(1, Direction::OUT, None, Some(&[10, 30])).unwrap();
+        assert_eq!(result.len(), 2);
+
+        let mut dst_ids: Vec<u64> = result.iter().map(|e| e.key.secondary_id).collect();
+        dst_ids.sort_unstable();
+        assert_eq!(dst_ids, vec![10, 30]);
+    }
+
+    #[test]
+    fn get_edges_no_match_returns_empty() {
+        let (store, _dir) = open_temp_store();
+        assert!(store.get_edges(99, Direction::OUT, None, None).unwrap().is_empty());
+        assert!(store.get_edges(99, Direction::IN, None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_edges_multiple_from_same_source() {
+        let (mut store, _dir) = open_temp_store();
+        store
+            .insert_edges(&[
+                make_edge(EdgeKey::out_e(1, 1, 10, 0), vec![]),
+                make_edge(EdgeKey::out_e(1, 1, 20, 0), vec![]),
+                make_edge(EdgeKey::out_e(1, 1, 30, 0), vec![]),
+                make_edge(EdgeKey::out_e(2, 1, 10, 0), vec![]), // different src
+            ])
+            .unwrap();
+
+        // Only edges from src=1
+        let edges = store.get_edges(1, Direction::OUT, None, None).unwrap();
+        assert_eq!(edges.len(), 3);
+        assert!(edges.iter().all(|e| e.key.primary_id == 1));
+    }
+}

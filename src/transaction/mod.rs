@@ -16,4 +16,5 @@ pub mod overlay;
 pub mod tx;
 
 pub use dirty_cache::{DirtyEntry, ExistenceMutation, PropMutation};
+pub use id_gen::IdGen;
 pub use tx::Transaction;

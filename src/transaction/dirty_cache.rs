@@ -12,16 +12,21 @@
 
 use std::collections::HashMap;
 
-use crate::types::{LabelId, Primitive, PropKey};
+use smol_str::SmolStr;
+
+use crate::types::{Primitive, PropKey};
 
 // ── Existence mutation ────────────────────────────────────────────────────────
 
 /// What happened to the element's existence within this transaction.
 #[derive(Debug, Clone)]
 pub enum ExistenceMutation {
-    /// Element was created in this transaction; carries the assigned label.
-    New(LabelId),
-    /// Element already existed in storage before this transaction.
+    /// Vertex was created in this transaction; carries the string label.
+    NewVertex(SmolStr),
+    /// Edge was created in this transaction.
+    /// The label is already encoded in the `EdgeKey` stored in `ElementKey::Edge`.
+    NewEdge,
+    /// Element already existed in storage before this transaction began.
     Existing,
     /// Element has been deleted in this transaction.
     Tombstone,
@@ -42,8 +47,9 @@ pub enum PropMutation {
 
 /// Uncommitted state for one graph element (vertex or edge).
 ///
-/// Keyed by `ElementKey` in `Transaction::dirty`.  A single struct covers
-/// both element types because their delta structure is identical.
+/// Keyed by `ElementKey` in `Transaction::dirty`.  Edge keys are always in
+/// canonical (`Out`) form.  A single struct covers both element types because
+/// their delta structure is identical.
 #[derive(Debug, Clone)]
 pub struct DirtyEntry {
     pub existence: ExistenceMutation,
