@@ -10,7 +10,9 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
-pub mod cache;
-pub mod distributed;
-pub mod rocks;
-pub mod graph_store;
+mod encoding;
+pub(super) mod graph;
+mod store;
+mod transaction;
+
+pub use store::RocksStorage;

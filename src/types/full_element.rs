@@ -10,46 +10,44 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::sync::Arc;
-
-use smol_str::SmolStr;
-
-use crate::types::element::{EdgeKey, VertexKey};
 use crate::types::gvalue::Property;
+use crate::types::keys::{CanonicalEdgeKey, LabelId, Rank, VertexKey};
 
-// ── FullVertex / FullEdge ─────────────────────────────────────────────────────
+// ── FullVertex ────────────────────────────────────────────────────────────────
 
-/// The single authoritative in-process copy of a vertex's committed state.
+/// The ground-truth vertex record crossing the store ↔ context boundary.
 ///
-/// Lives in the `Transaction::read_buffer` (per-query) and/or the
-/// `SharedStoreCache` (process-wide).  Never mutated after insertion.
-#[derive(Debug, Clone)]
+/// Returned by `GraphTransaction::get_vertex` and stored inside `GraphContext`'s
+/// overlay.  The traversal engine accesses properties directly via
+/// `ctx.vertex(idx)` without copying or dereferencing an extra wrapper.
+/// There is no `Existence` field — the store never returns tombstoned elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FullVertex {
     pub id: VertexKey,
-    pub label: SmolStr,
+    pub label_id: LabelId,
     pub props: Vec<Property>,
 }
 
-/// The single authoritative in-process copy of an edge's committed state.
+// ── FullEdge ──────────────────────────────────────────────────────────────────
+
+/// The ground-truth edge record crossing the store ↔ context boundary.
 ///
-/// `key` is in canonical (`Out`) direction — the `In` view is derived on
-/// demand via `EdgeKey::flip`.
-#[derive(Debug, Clone)]
+/// Always in canonical `Out` orientation.  The engine derives the directed
+/// `EdgeKey` from `canonical_key()` plus the direction it requested.
+/// 
+/// TODO: haven't considered the property ordering implications of `Vec<Property>` yet.  If we need to support
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FullEdge {
-    pub key: EdgeKey,
+    pub src_id: VertexKey,
+    pub label_id: LabelId,
+    pub rank: Rank,
+    pub dst_id: VertexKey,
     pub props: Vec<Property>,
 }
 
-// ── FullElement ───────────────────────────────────────────────────────────────
-
-/// Union of `FullVertex` and `FullEdge` for heterogeneous caches.
-///
-/// The `Transaction::read_buffer` and `SharedStoreCache` both store
-/// `Arc<FullElement>` keyed by `ElementKey`.  The inner `Arc<FullVertex>` /
-/// `Arc<FullEdge>` can be cloned cheaply and handed to `GValue` handles
-/// without copying or keeping the whole `FullElement` alive indirectly.
-#[derive(Debug, Clone)]
-pub enum FullElement {
-    Vertex(Arc<FullVertex>),
-    Edge(Arc<FullEdge>),
+impl FullEdge {
+    /// Extract the direction-free canonical key (same as the `edges_out` CF key).
+    pub fn canonical_key(&self) -> CanonicalEdgeKey {
+        CanonicalEdgeKey { src_id: self.src_id, label_id: self.label_id, rank: self.rank, dst_id: self.dst_id }
+    }
 }

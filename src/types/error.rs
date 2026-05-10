@@ -13,33 +13,42 @@
 use std::fmt;
 
 #[derive(Debug)]
-pub enum StorageError {
+pub enum StoreError {
+    /// A required key was not found.
+    ///
+    /// Not emitted by the storage layer itself (absent keys return `Ok(None)`);
+    /// reserved for higher-level callers that treat absence as a hard error
+    /// (e.g. a mutation step that requires a vertex to exist).
     NotFound,
+    /// OCC commit failed because a key in the read-set was modified by a
+    /// concurrent transaction.  Callers should retry from scratch.
+    Conflict,
     Io(std::io::Error),
     Other(String),
 }
 
-impl fmt::Display for StorageError {
+impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StorageError::NotFound => write!(f, "key not found"),
-            StorageError::Io(e) => write!(f, "I/O error: {e}"),
-            StorageError::Other(msg) => write!(f, "{msg}"),
+            StoreError::NotFound => write!(f, "key not found"),
+            StoreError::Conflict => write!(f, "transaction conflict; retry"),
+            StoreError::Io(e) => write!(f, "I/O error: {e}"),
+            StoreError::Other(msg) => write!(f, "{msg}"),
         }
     }
 }
 
-impl std::error::Error for StorageError {
+impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            StorageError::Io(e) => Some(e),
+            StoreError::Io(e) => Some(e),
             _ => None,
         }
     }
 }
 
-impl From<std::io::Error> for StorageError {
+impl From<std::io::Error> for StoreError {
     fn from(e: std::io::Error) -> Self {
-        StorageError::Io(e)
+        StoreError::Io(e)
     }
 }

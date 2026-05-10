@@ -10,28 +10,18 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::{
-    hash::{Hash, Hasher},
-    sync::{Arc, Weak},
-};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use smol_str::SmolStr;
 
-use crate::types::{
-    full_element::{FullEdge, FullElement, FullVertex},
-    prop_key::PropKey,
-};
+use crate::types::keys::{CanonicalKey, EdgeKey, VertexKey};
+use crate::types::prop_key::PropKey;
 
 // ── Primitive ────────────────────────────────────────────────────────────────
 
 /// A scalar value that can appear as a property value or standalone scalar.
-///
-/// `f32`/`f64` do not implement `Eq`/`Hash` in std, so we implement them
-/// manually using bitwise comparison (`to_bits()`).  Two NaN values with
-/// identical bits compare equal — intentional for map-key use.
-///
-/// UUIDs are stored as raw `u128` to avoid a crate dependency.
 #[derive(Debug, Clone)]
 pub enum Primitive {
     Bool(bool),
@@ -82,31 +72,18 @@ impl Hash for Primitive {
 
 /// A single property value together with its owning element.
 ///
-/// Stored in `Vec<Property>` inside `FullVertex`/`FullEdge`.
-///
-/// `owner` is a `Weak<FullElement>` back-pointer so the property can reach
-/// the ground-truth element without a cache look-up.  `Weak` (not `Arc`)
-/// breaks the reference cycle: `Arc<FullElement>` → `Arc<FullVertex/FullEdge>`
-/// → `Vec<Property>` → `Property` → back to `Arc<FullElement>`.
-/// Construct via `Arc::new_cyclic`.
-#[derive(Debug, Clone)]
+/// `owner` identifies the vertex or edge this property belongs to.  The engine
+/// uses `owner` to call mutation methods on the transaction (e.g. for `drop()`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Property {
-    pub owner: Weak<FullElement>,
+    pub owner: CanonicalKey,
     pub key: PropKey,
     pub value: Primitive,
 }
 
-impl PartialEq for Property {
-    fn eq(&self, other: &Self) -> bool {
-        Weak::ptr_eq(&self.owner, &other.owner) && self.key == other.key && self.value == other.value
-    }
-}
-
-impl Eq for Property {}
-
 impl Hash for Property {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.owner.as_ptr().hash(state);
+        self.owner.hash(state);
         self.key.hash(state);
         self.value.hash(state);
     }
@@ -116,19 +93,19 @@ impl Hash for Property {
 
 /// The universal in-memory value type flowing through a traversal pipeline.
 ///
-/// `Vertex` and `Edge` hold a direct `Arc` to the authoritative cache entry,
-/// giving zero-copy access to identity, label, and all properties.
+/// `Vertex` wraps a `VertexKey`; `Edge` wraps an `EdgeKey` (direction-aware).
+/// The engine calls `ctx.get_vertex(key)` / `ctx.get_edges(…)` to obtain
+/// `&FullVertex` / `&FullEdge` references when it needs property data.
 ///
-/// `List` and `Map` are reference-counted for cheap clone.
-///
-/// `Eq` and `Hash` are implemented manually:
-/// - `Vertex` uses `FullVertex::id` for identity; `Edge` uses `FullEdge::key`.
-/// - Float variants in `Scalar`/`Property` use bit-pattern comparison.
+/// Both key types are `Copy` (8 / 24 bytes), so `GValue` is cheap to clone.
 #[derive(Debug, Clone)]
 pub enum GValue {
-    Vertex(Arc<FullVertex>),
-    Edge(Arc<FullEdge>),
-    /// A property value travelling through the pipeline as a standalone element.
+    /// A vertex identified by its store key.
+    Vertex(VertexKey),
+    /// A directed edge.  The `EdgeKey` preserves traversal direction (Out / In)
+    /// for `path()` / `select()` identity.
+    Edge(EdgeKey),
+    /// A property travelling through the pipeline as a standalone element.
     Property(Property),
     Scalar(Primitive),
     List(Arc<Vec<GValue>>),
@@ -139,8 +116,8 @@ pub enum GValue {
 impl PartialEq for GValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Vertex(a), Self::Vertex(b)) => a.id == b.id,
-            (Self::Edge(a), Self::Edge(b)) => a.key == b.key,
+            (Self::Vertex(a), Self::Vertex(b)) => a == b,
+            (Self::Edge(a), Self::Edge(b)) => a == b,
             (Self::Property(a), Self::Property(b)) => a == b,
             (Self::Scalar(a), Self::Scalar(b)) => a == b,
             (Self::List(a), Self::List(b)) => a == b,
@@ -157,8 +134,8 @@ impl Hash for GValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
-            Self::Vertex(fv) => fv.id.hash(state),
-            Self::Edge(fe) => fe.key.hash(state),
+            Self::Vertex(key) => key.hash(state),
+            Self::Edge(key) => key.hash(state),
             Self::Property(p) => p.hash(state),
             Self::Scalar(p) => p.hash(state),
             Self::List(list) => {

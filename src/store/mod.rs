@@ -10,12 +10,10 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
-pub mod encoding;
-pub mod graph;
-pub mod store;
+pub mod distributed;
+pub mod id_gen;
+pub mod rocks;
+pub mod traits;
 
-pub use encoding::{
-    decode_edge_key, decode_vertex_key, encode_edge_key, encode_vertex_key, EdgeValue, VertexValue,
-    CF_EDGES_IN, CF_EDGES_OUT, CF_VERTICES,
-};
-pub use store::RocksStorage;
+pub use rocks::RocksStorage;
+pub use traits::{GraphStore, GraphTransaction};

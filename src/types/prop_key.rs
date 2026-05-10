@@ -12,18 +12,9 @@
 
 use smol_str::SmolStr;
 
-/// Name of a property key. Stack-allocated for strings up to 22 bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PropKey(pub SmolStr);
-
-impl PropKey {
-    pub fn new(s: impl Into<SmolStr>) -> Self {
-        Self(s.into())
-    }
-}
-
-impl From<&str> for PropKey {
-    fn from(s: &str) -> Self {
-        Self(SmolStr::new(s))
-    }
-}
+/// Name of a property key.
+///
+/// Stack-allocated for strings up to 22 bytes; heap-allocated only for
+/// unusually long key names.  No interning or numeric mapping — the raw
+/// string is the identity.
+pub type PropKey = SmolStr;

@@ -30,5 +30,8 @@
     # RocksDB storage backend
     rocksdb = "0.22"
 
+    # Bidirectional hash map — used by Schema for label_id ↔ label_string lookup
+    bimap = "0.6"
+
 [dev-dependencies]
     tempfile = "3"

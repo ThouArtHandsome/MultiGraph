@@ -13,3 +13,5 @@
 pub mod definition;
 pub mod index;
 pub mod validator;
+
+pub use definition::Schema;
