@@ -35,7 +35,7 @@ pub struct FullVertex {
 ///
 /// Always in canonical `Out` orientation.  The engine derives the directed
 /// `EdgeKey` from `canonical_key()` plus the direction it requested.
-/// 
+///
 /// TODO: haven't considered the property ordering implications of `Vec<Property>` yet.  If we need to support
 #[derive(Debug)]
 pub struct FullEdge {
@@ -59,7 +59,7 @@ impl PartialEq for FullVertex {
         if self.id != other.id || self.label_id != other.label_id {
             return false;
         }
-        
+
         // Lock both sides to compare properties
         let p1 = self.props.read().unwrap();
         let p2 = other.props.read().unwrap();
@@ -72,10 +72,14 @@ impl Eq for FullVertex {}
 impl PartialEq for FullEdge {
     fn eq(&self, other: &Self) -> bool {
         // Compare basic fields
-        if self.src_id != other.src_id || self.label_id != other.label_id || self.rank != other.rank || self.dst_id != other.dst_id {
+        if self.src_id != other.src_id
+            || self.label_id != other.label_id
+            || self.rank != other.rank
+            || self.dst_id != other.dst_id
+        {
             return false;
         }
-        
+
         // Lock both sides to compare properties
         let p1 = self.props.read().unwrap();
         let p2 = other.props.read().unwrap();

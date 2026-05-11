@@ -10,6 +10,8 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::fmt::Display;
+
 /// Unique identifier for a vertex.
 pub type VertexKey = u64;
 
@@ -64,6 +66,12 @@ impl CanonicalEdgeKey {
             secondary_id: self.src_id,
             rank: self.rank,
         }
+    }
+}
+
+impl Display for CanonicalEdgeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({} -{}-> {})[rank={}]", self.src_id, self.label_id, self.dst_id, self.rank)
     }
 }
 

@@ -32,11 +32,15 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use multigraph::types::error::StoreError;
-    use multigraph::context::GraphContext;
-    use multigraph::store::{GraphStore, RocksStorage};
-    use multigraph::types::gvalue::Primitive;
-    use multigraph::types::keys::{CanonicalEdgeKey, CanonicalKey, Direction};
+    use multigraph::{
+        context::GraphContext,
+        store::{GraphStore, RocksStorage},
+        types::{
+            error::StoreError,
+            gvalue::Primitive,
+            keys::{CanonicalEdgeKey, CanonicalKey, Direction},
+        },
+    };
     use smol_str::SmolStr;
 
     fn open() -> (RocksStorage, tempfile::TempDir) {
@@ -105,11 +109,11 @@ mod tests {
             .unwrap();
             // Alice -> London
             let e1 = cek(alice, 2, city_key);
-            c.add_edge(e1);
+            let _ = c.add_edge(e1);
             c.set_property(CanonicalKey::Edge(e1), SmolStr::new("since"), Primitive::Int32(2015)).unwrap();
             // Bob -> London
             let e2 = cek(bob, 2, city_key);
-            c.add_edge(e2);
+            let _ = c.add_edge(e2);
             c.set_property(CanonicalKey::Edge(e2), SmolStr::new("since"), Primitive::Int32(2019)).unwrap();
             c.commit().unwrap();
             city_key
@@ -137,7 +141,7 @@ mod tests {
         assert_eq!(alice_out.len(), 1);
         let (e_idx, fe) = &alice_out[0];
         assert_eq!(e_idx.secondary_id, london);
-        assert_eq!(eprop(&fe, "since"), Some(Primitive::Int32(2015)));
+        assert_eq!(eprop(fe, "since"), Some(Primitive::Int32(2015)));
 
         // London has two incoming edges: one from Alice, one from Bob.
         let london_in = c.get_edges(london, Direction::IN, Some(2), None).unwrap();
@@ -159,9 +163,9 @@ mod tests {
 
         c.set_property(CanonicalKey::Vertex(v1), SmolStr::new("role"), Primitive::String(SmolStr::new("src"))).unwrap();
         c.set_property(CanonicalKey::Vertex(v2), SmolStr::new("role"), Primitive::String(SmolStr::new("dst"))).unwrap();
-        
+
         let e = cek(v1, 3, v2);
-        c.add_edge(e);
+        let _ = c.add_edge(e);
         c.set_property(CanonicalKey::Edge(e), SmolStr::new("w"), Primitive::Float64(0.5)).unwrap();
 
         // All elements are visible in the same context before any commit.
@@ -198,7 +202,7 @@ mod tests {
             .map(|_| {
                 let mut c = new_ctx(&store);
                 let (key, _) = c.add_vertex(1);
-                c.add_edge(cek(hub, 1, key));
+                let _ = c.add_edge(cek(hub, 1, key));
                 c.commit().unwrap();
                 key
             })
@@ -239,7 +243,7 @@ mod tests {
         };
 
         // ctx2 — person: Bob
-         let mut c2 = new_ctx(&store);
+        let mut c2 = new_ctx(&store);
         let bob = {
             let (key, _) = c2.add_vertex(1);
             c2.set_property(CanonicalKey::Vertex(key), SmolStr::new("name"), Primitive::String(SmolStr::new("Bob")))
@@ -250,8 +254,7 @@ mod tests {
 
         c2.commit().unwrap();
         c1.commit().unwrap(); // commit after c2 to test concurrent visibility of both contexts
-    
-        
+
         // ctx3 — city: London + two "lives_in" edges (label=2) from each person
         let london = {
             let mut c = new_ctx(&store);
@@ -264,11 +267,11 @@ mod tests {
             .unwrap();
             // Alice -> London
             let e1 = cek(alice, 2, city_key);
-            c.add_edge(e1);
+            let _ = c.add_edge(e1);
             c.set_property(CanonicalKey::Edge(e1), SmolStr::new("since"), Primitive::Int32(2015)).unwrap();
             // Bob -> London
             let e2 = cek(bob, 2, city_key);
-            c.add_edge(e2);
+            let _ = c.add_edge(e2);
             c.set_property(CanonicalKey::Edge(e2), SmolStr::new("since"), Primitive::Int32(2019)).unwrap();
             c.commit().unwrap();
             city_key
@@ -296,7 +299,7 @@ mod tests {
         assert_eq!(alice_out.len(), 1);
         let (e_idx, fe) = &alice_out[0];
         assert_eq!(e_idx.secondary_id, london);
-        assert_eq!(eprop(&fe, "since"), Some(Primitive::Int32(2015)));
+        assert_eq!(eprop(fe, "since"), Some(Primitive::Int32(2015)));
 
         // London has two incoming edges: one from Alice, one from Bob.
         let london_in = c.get_edges(london, Direction::IN, Some(2), None).unwrap();

@@ -44,19 +44,23 @@
 //! underlying `OptimisticTransactionDB` is alive for the entire duration of
 //! both fields.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use rocksdb::{Direction as ScanDir, IteratorMode, OptimisticTransactionDB, ReadOptions};
 
-use crate::store::rocks::encoding::{
-    decode_edge_key_in, decode_edge_key_out, edge_scan_prefix, encode_edge_key_in, encode_edge_key_out,
-    encode_vertex_key, prefix_upper_bound, EdgeValue, VertexValue, CF_EDGES_IN, CF_EDGES_OUT, CF_VERTICES,
+use crate::{
+    store::{
+        rocks::{
+            encoding::{
+                decode_edge_key_in, decode_edge_key_out, edge_scan_prefix, encode_edge_key_in, encode_edge_key_out,
+                encode_vertex_key, prefix_upper_bound, EdgeValue, VertexValue, CF_EDGES_IN, CF_EDGES_OUT, CF_VERTICES,
+            },
+            graph::{build_full_edge, build_full_vertex, encode_props},
+        },
+        traits::GraphTransaction,
+    },
+    types::{gvalue::Property, CanonicalEdgeKey, Direction, FullEdge, FullVertex, LabelId, StoreError, VertexKey},
 };
-use crate::store::rocks::graph::{build_full_edge, build_full_vertex, encode_props};
-use crate::store::traits::GraphTransaction;
-use crate::types::gvalue::Property;
-use crate::types::{CanonicalEdgeKey, Direction, FullEdge, FullVertex, LabelId, StoreError, VertexKey};
 
 type EdgeKeyDecoder = fn(&[u8]) -> Option<CanonicalEdgeKey>;
 
@@ -122,13 +126,14 @@ impl GraphTransaction for Transaction {
         }
     }
 
+    // TODO: do we need `GetForUpdate` for edges?
     fn get_edge(&mut self, key: CanonicalEdgeKey) -> Result<Option<Arc<FullEdge>>, StoreError> {
         let cf = self.db.cf_handle(CF_EDGES_OUT).ok_or_else(|| StoreError::Other("missing CF: edges_out".into()))?;
         let raw_opt = self
             .db_txn
             .as_ref()
             .expect("no active transaction")
-            .get_cf(&cf, encode_edge_key_out(key))
+            .get_for_update_cf(&cf, encode_edge_key_out(key), false)
             .map_err(|e| StoreError::Other(e.to_string()))?;
 
         match raw_opt {

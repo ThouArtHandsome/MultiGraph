@@ -61,17 +61,24 @@
 //! clean vertex is mutated, giving copy-on-write semantics without an upfront
 //! allocation on the read path.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
-use crate::store::id_gen::IdGen;
-use crate::store::traits::{GraphStore, GraphTransaction};
-use crate::types::keys::{CanonicalEdgeKey, CanonicalKey, Direction, EdgeKey, LabelId, VertexKey};
-use crate::types::full_element::{FullEdge, FullVertex};
-use crate::types::gvalue::{Primitive, Property};
-use crate::types::prop_key::PropKey;
-use crate::types::StoreError;
+use crate::{
+    store::{
+        id_gen::IdGen,
+        traits::{GraphStore, GraphTransaction},
+    },
+    types::{
+        full_element::{FullEdge, FullVertex},
+        gvalue::{Primitive, Property},
+        keys::{CanonicalEdgeKey, CanonicalKey, Direction, EdgeKey, LabelId, VertexKey},
+        prop_key::PropKey,
+        StoreError,
+    },
+};
 
 // ── Existence ─────────────────────────────────────────────────────────────────
 
@@ -117,7 +124,9 @@ impl<S: GraphStore> GraphContext<S> {
         if !self.vertices.contains_key(&key) {
             match self.store.get_vertex(key)? {
                 None => return Ok(None),
-                Some(arc) => { self.vertices.insert(key, arc); }
+                Some(arc) => {
+                    self.vertices.insert(key, arc);
+                }
             }
         }
         if self.dirty.get(&CanonicalKey::Vertex(key)) == Some(&Existence::Tombstone) {
@@ -133,7 +142,9 @@ impl<S: GraphStore> GraphContext<S> {
         if !self.edges.contains_key(&key) {
             match self.store.get_edge(key)? {
                 None => return Ok(None),
-                Some(arc) => { self.edges.insert(key, arc); }
+                Some(arc) => {
+                    self.edges.insert(key, arc);
+                }
             }
         }
         if self.dirty.get(&CanonicalKey::Edge(key)) == Some(&Existence::Tombstone) {
@@ -184,9 +195,10 @@ impl<S: GraphStore> GraphContext<S> {
     ///
     /// Returns `(VertexKey, &FullVertex)` — the key is globally unique (from
     /// `id_gen`); the reference gives immediate read access within this context.
+    /// TODO: VertexKey should be specified by the caller to have the chance to check for duplicates before allocation.
     pub fn add_vertex(&mut self, label_id: LabelId) -> (VertexKey, Arc<FullVertex>) {
         let id = self.id_gen.next_vertex_id();
-        self.vertices.insert(id, Arc::new(FullVertex { id, label_id, props: RwLock::new(Vec::new())}));
+        self.vertices.insert(id, Arc::new(FullVertex { id, label_id, props: RwLock::new(Vec::new()) }));
         self.dirty.insert(CanonicalKey::Vertex(id), Existence::New);
         (id, self.vertices[&id].clone())
     }
@@ -198,17 +210,28 @@ impl<S: GraphStore> GraphContext<S> {
     /// # Panics (debug)
     ///
     /// Asserts the key is not already in the overlay.
-    pub fn add_edge(&mut self, cek: CanonicalEdgeKey) -> (EdgeKey, Arc<FullEdge>) {
-        debug_assert!(!self.edges.contains_key(&cek), "add_edge called with duplicate CanonicalEdgeKey");
-        self.edges.insert(cek, Arc::new(FullEdge {
-            src_id: cek.src_id,
-            label_id: cek.label_id,
-            rank: cek.rank,
-            dst_id: cek.dst_id,
-            props: RwLock::new(Vec::new()),
-        }));
+    pub fn add_edge(&mut self, cek: CanonicalEdgeKey) -> Result<(EdgeKey, Arc<FullEdge>), StoreError> {
+        if self.edges.contains_key(&cek) {
+            return Err(StoreError::DuplicateEdge(cek));
+        }
+        // 1. try to retrieve edge from store to check for duplicates before allocation.
+        if let Some(_) = self.store.get_edge(cek)? {
+            return Err(StoreError::DuplicateEdge(cek));
+        }
+
+        // 2. insert new edge into overlay and mark dirty.  The store is not touched until commit.
+        self.edges.insert(
+            cek,
+            Arc::new(FullEdge {
+                src_id: cek.src_id,
+                label_id: cek.label_id,
+                rank: cek.rank,
+                dst_id: cek.dst_id,
+                props: RwLock::new(Vec::new()),
+            }),
+        );
         self.dirty.insert(CanonicalKey::Edge(cek), Existence::New);
-        (cek.out_key(), self.edges[&cek].clone())
+        Ok((cek.out_key(), self.edges[&cek].clone()))
     }
 
     /// Upsert a property on a vertex or edge.
@@ -223,11 +246,11 @@ impl<S: GraphStore> GraphContext<S> {
                     return Err(StoreError::Other("element is tombstoned".into()));
                 }
                 match self.vertices.get_mut(&id) {
-                    None => return Err(StoreError::Other(format!("vertex {id} not loaded"))),
+                    None => return Err(StoreError::Other(format!("vertex {id} not exist"))),
                     Some(arc) => {
                         // 1. Acquire a write lock on the properties
                         let mut props = arc.props.write().map_err(|_| StoreError::LockError)?;
-                        
+
                         // 2. Modify in place. No cloning happens!
                         upsert_prop(&mut props, key, prop, value);
                         // upsert_prop(&mut Arc::make_mut(arc).props, key, prop, value),
@@ -315,8 +338,7 @@ impl<S: GraphStore> GraphContext<S> {
     pub fn commit(&mut self) -> Result<(), StoreError> {
         // Collect first so the loop body can borrow self.vertices / self.edges
         // and self.store simultaneously without a conflict on self.dirty.
-        let dirty: Vec<(CanonicalKey, Existence)> =
-            self.dirty.iter().map(|(&k, &v)| (k, v)).collect();
+        let dirty: Vec<(CanonicalKey, Existence)> = self.dirty.iter().map(|(&k, &v)| (k, v)).collect();
         for (key, existence) in dirty {
             match (key, existence) {
                 (CanonicalKey::Vertex(id), Existence::New | Existence::Modified) => {
@@ -402,7 +424,6 @@ fn edge_matches(
     true
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -412,10 +433,14 @@ mod tests {
     use super::GraphContext;
     use crate::store::traits::GraphStore;
 
-    use crate::store::RocksStorage;
-    use crate::types::StoreError;
-    use crate::types::gvalue::Primitive;
-    use crate::types::keys::{CanonicalEdgeKey, CanonicalKey, Direction};
+    use crate::{
+        store::RocksStorage,
+        types::{
+            gvalue::Primitive,
+            keys::{CanonicalEdgeKey, CanonicalKey, Direction},
+            StoreError,
+        },
+    };
 
     fn open() -> (RocksStorage, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -466,13 +491,41 @@ mod tests {
         let (store, _dir) = open();
         let mut c = ctx(&store);
         let k = cek(1, 5, 2);
-        let (key, fe) = c.add_edge(k);
+        let (key, fe) = c.add_edge(k).unwrap();
         let result = c.get_edge(k).unwrap().unwrap();
         assert_eq!(k.out_key(), key);
         assert_eq!(result, fe);
         assert_eq!((result.src_id, result.label_id, result.dst_id), (1, 5, 2));
     }
 
+    #[test]
+    fn add_duplicated_edge_should_fail() {
+        let (store, _dir) = open();
+        let mut c = ctx(&store);
+        let k = cek(1, 5, 2);
+        let _ = c.add_edge(k);
+
+        c.commit().unwrap();
+
+        let mut c = ctx(&store);
+        let result = c.add_edge(k);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn concurrent_add_same_edge_should_fail() {
+        let (store, _dir) = open();
+        let mut c1 = ctx(&store);
+        let mut c2 = ctx(&store);
+        let k = cek(1, 5, 2);
+
+        c1.add_edge(k).unwrap();
+        c2.add_edge(k).unwrap();
+
+        c1.commit().unwrap();
+        let result = c2.commit();
+        assert!(matches!(result, Err(StoreError::Conflict)));
+    }
     // ── set_property ─────────────────────────────────────────────────────────
 
     #[test]
@@ -526,6 +579,31 @@ mod tests {
         assert_eq!(e_props[0].value, Primitive::Float64(1.5));
     }
 
+    #[test]
+    fn concurrent_set_property_should_conflict_on_commit() {
+        let (store, _dir) = open();
+        let mut c1 = ctx(&store);
+        let (key, _) = c1.add_vertex(1);
+        c1.commit().unwrap();
+
+        // Two contexts load the same vertex, then concurrently update the same property key with different values.
+        let mut c2 = ctx(&store);
+        let mut c3 = ctx(&store);
+        let _ = c2.get_vertex(key);
+        let _ = c3.get_vertex(key);
+        c2.set_property(CanonicalKey::Vertex(key), SmolStr::new("x"), Primitive::Int32(1)).unwrap();
+        c3.set_property(CanonicalKey::Vertex(key), SmolStr::new("x"), Primitive::Int32(2)).unwrap();
+
+        c2.commit().unwrap();
+
+        let result = c3.commit();
+        assert!(matches!(result, Err(StoreError::Conflict)));
+        let mut c4 = ctx(&store);
+        let v = c4.get_vertex(key).unwrap().unwrap();
+        let v_props = v.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(v_props.len(), 1);
+        assert_eq!(v_props[0].value, Primitive::Int32(1));
+    }
     // ── drop_property ─────────────────────────────────────────────────────────
 
     #[test]
@@ -555,6 +633,48 @@ mod tests {
         assert!(v_props.is_empty());
     }
 
+    #[test]
+    fn concurrent_drop_property_conflits_with_set_property() {
+        let (store, _dir) = open();
+        let mut c1 = ctx(&store);
+        let (key, _) = c1.add_vertex(1);
+        c1.set_property(CanonicalKey::Vertex(key), SmolStr::new("x"), Primitive::Int32(1)).unwrap();
+        c1.commit().unwrap();
+
+        let mut c2 = ctx(&store);
+        let mut c3 = ctx(&store);
+        let _ = c2.get_vertex(key).unwrap();
+        let _ = c3.get_vertex(key).unwrap();
+        c2.drop_property(CanonicalKey::Vertex(key), &SmolStr::new("x")).unwrap();
+        c3.set_property(CanonicalKey::Vertex(key), SmolStr::new("x"), Primitive::Int32(2)).unwrap();
+
+        c2.commit().unwrap();
+
+        let result = c3.commit();
+        assert!(matches!(result, Err(StoreError::Conflict)));
+    }
+
+    #[test]
+    fn concurrent_set_property_conflits_with_drop_property() {
+        let (store, _dir) = open();
+        let mut c1 = ctx(&store);
+        let (key, _) = c1.add_vertex(1);
+        c1.set_property(CanonicalKey::Vertex(key), SmolStr::new("x"), Primitive::Int32(1)).unwrap();
+        c1.commit().unwrap();
+
+        let mut c2 = ctx(&store);
+        let mut c3 = ctx(&store);
+        let _ = c2.get_vertex(key).unwrap();
+        let _ = c3.get_vertex(key).unwrap();
+        c2.set_property(CanonicalKey::Vertex(key), SmolStr::new("x"), Primitive::Int32(2)).unwrap();
+        c3.drop_property(CanonicalKey::Vertex(key), &SmolStr::new("x")).unwrap();
+
+        c2.commit().unwrap();
+
+        let result = c3.commit();
+        assert!(matches!(result, Err(StoreError::Conflict)));
+    }
+
     // ── drop_element ──────────────────────────────────────────────────────────
 
     #[test]
@@ -571,7 +691,7 @@ mod tests {
         let (store, _dir) = open();
         let mut c = ctx(&store);
         let k = cek(1, 5, 2);
-        c.add_edge(k);
+        let _ = c.add_edge(k);
         c.drop_element(CanonicalKey::Edge(k)).unwrap();
         assert!(c.get_edge(k).unwrap().is_none());
     }
@@ -586,6 +706,72 @@ mod tests {
         assert!(err.is_err());
     }
 
+    #[test]
+    fn concurrent_add_edge_then_drop_should_conflict_on_commit() {
+        let (store, _dir) = open();
+        let mut c1 = ctx(&store);
+        let mut c2 = ctx(&store);
+        let k = cek(1, 5, 2);
+
+        c1.add_edge(k).unwrap();
+        c2.add_edge(k).unwrap();
+
+        c1.commit().unwrap();
+        c2.drop_element(CanonicalKey::Edge(k)).unwrap();
+        let result = c2.commit();
+        assert!(matches!(result, Err(StoreError::Conflict)));
+    }
+
+    #[test]
+    fn concurrent_drop_vertex_then_add_edge_should_conflict_on_commit() {
+        let (store, _dir) = open();
+        let mut c1 = ctx(&store);
+        let (v1, _) = c1.add_vertex(1);
+        let (v2, _) = c1.add_vertex(2);
+        c1.commit().unwrap();
+
+        let mut c2 = ctx(&store);
+        let mut c3 = ctx(&store);
+
+        let k = cek(v1, 5, v2);
+        let _ = c2.get_vertex(v1).unwrap().unwrap();
+        let _ = c2.get_vertex(v2).unwrap().unwrap();
+        let _ = c3.get_vertex(v1).unwrap().unwrap();
+
+        let _ = c2.add_edge(k).unwrap();
+        c3.drop_element(CanonicalKey::Vertex(v1)).unwrap();
+
+        assert!(c3.commit().is_ok(), "c2 should commit successfully");
+
+        let result = c2.commit();
+        assert!(matches!(result, Err(StoreError::Conflict)));
+    }
+
+    #[test]
+    #[ignore = "Wait for fixing the issue that the second committer (c3) does not detect the conflict and commits successfully, which should not happen."]
+    fn concurrent_add_edge_then_drop_vertex_should_conflict_on_commit() {
+        let (store, _dir) = open();
+        let mut c1 = ctx(&store);
+        let (v1, _) = c1.add_vertex(1);
+        let (v2, _) = c1.add_vertex(2);
+        c1.commit().unwrap();
+
+        let mut c2 = ctx(&store);
+        let mut c3 = ctx(&store);
+
+        let k = cek(v1, 5, v2);
+        let _ = c2.get_vertex(v1).unwrap();
+        let _ = c2.get_vertex(v2).unwrap();
+        let _ = c3.get_vertex(v1).unwrap();
+
+        let _ = c2.add_edge(k).unwrap();
+        c3.drop_element(CanonicalKey::Vertex(v1)).unwrap();
+
+        assert!(c2.commit().is_ok(), "c2 should commit successfully");
+
+        let result = c3.commit();
+        assert!(matches!(result, Err(StoreError::Conflict)));
+    }
     // ── commit ────────────────────────────────────────────────────────────────
 
     #[test]
@@ -613,7 +799,7 @@ mod tests {
         let k = cek(10, 3, 20);
         {
             let mut c = ctx(&store);
-            c.add_edge(k);
+            let _ = c.add_edge(k);
             c.set_property(CanonicalKey::Edge(k), SmolStr::new("w"), Primitive::Int32(99)).unwrap();
             c.commit().unwrap();
         }
@@ -639,7 +825,7 @@ mod tests {
 
         {
             let mut c = ctx(&store);
-            c.get_vertex(id).unwrap();
+            let _ = c.get_vertex(id).unwrap();
             c.drop_element(CanonicalKey::Vertex(id)).unwrap();
             c.commit().unwrap();
         }
@@ -677,8 +863,8 @@ mod tests {
     fn get_edges_returns_new_dirty_edges_before_commit() {
         let (store, _dir) = open();
         let mut c = ctx(&store);
-        c.add_edge(cek(1, 1, 10));
-        c.add_edge(cek(1, 1, 20));
+        let _ = c.add_edge(cek(1, 1, 10));
+        let _ = c.add_edge(cek(1, 1, 20));
 
         let edges = c.get_edges(1, Direction::OUT, None, None).unwrap();
         assert_eq!(edges.len(), 2);
@@ -688,8 +874,8 @@ mod tests {
     fn get_edges_filters_tombstoned_edges() {
         let (store, _dir) = open();
         let mut c = ctx(&store);
-        c.add_edge(cek(1, 1, 10));
-        c.add_edge(cek(1, 1, 20));
+        let _ = c.add_edge(cek(1, 1, 10));
+        let _ = c.add_edge(cek(1, 1, 20));
         c.drop_element(CanonicalKey::Edge(cek(1, 1, 10))).unwrap();
 
         let edges = c.get_edges(1, Direction::OUT, None, None).unwrap();
@@ -700,7 +886,7 @@ mod tests {
     fn get_edges_direction_in_vs_out() {
         let (store, _dir) = open();
         let mut c = ctx(&store);
-        c.add_edge(cek(1, 1, 2));
+        let _ = c.add_edge(cek(1, 1, 2));
 
         let out = c.get_edges(1, Direction::OUT, None, None).unwrap();
         let in_ = c.get_edges(2, Direction::IN, None, None).unwrap();
@@ -715,9 +901,9 @@ mod tests {
     fn get_edges_label_filter() {
         let (store, _dir) = open();
         let mut c = ctx(&store);
-        c.add_edge(cek(1, 1, 10));
-        c.add_edge(cek(1, 2, 20));
-        c.add_edge(cek(1, 1, 30));
+        let _ = c.add_edge(cek(1, 1, 10));
+        let _ = c.add_edge(cek(1, 2, 20));
+        let _ = c.add_edge(cek(1, 1, 30));
 
         let label1 = c.get_edges(1, Direction::OUT, Some(1), None).unwrap();
         assert_eq!(label1.len(), 2);
@@ -731,9 +917,9 @@ mod tests {
     fn get_edges_dst_filter() {
         let (store, _dir) = open();
         let mut c = ctx(&store);
-        c.add_edge(cek(1, 1, 10));
-        c.add_edge(cek(1, 1, 20));
-        c.add_edge(cek(1, 1, 30));
+        let _ = c.add_edge(cek(1, 1, 10));
+        let _ = c.add_edge(cek(1, 1, 20));
+        let _ = c.add_edge(cek(1, 1, 30));
 
         let result = c.get_edges(1, Direction::OUT, None, Some(&[10, 30])).unwrap();
         assert_eq!(result.len(), 2);
@@ -750,12 +936,12 @@ mod tests {
         let k1 = cek(1, 1, 10);
         {
             let mut c = ctx(&store);
-            c.add_edge(k1);
+            let _ = c.add_edge(k1);
             c.commit().unwrap();
         }
 
         let mut c = ctx(&store);
-        c.add_edge(cek(1, 1, 20));
+        let _ = c.add_edge(cek(1, 1, 20));
         let edges = c.get_edges(1, Direction::OUT, None, None).unwrap();
         assert_eq!(edges.len(), 2);
     }

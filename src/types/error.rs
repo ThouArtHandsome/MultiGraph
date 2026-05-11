@@ -12,6 +12,8 @@
 
 use std::fmt;
 
+use crate::types::{CanonicalEdgeKey, VertexKey};
+
 #[derive(Debug)]
 pub enum StoreError {
     /// A required key was not found.
@@ -23,8 +25,11 @@ pub enum StoreError {
     /// OCC commit failed because a key in the read-set was modified by a
     /// concurrent transaction.  Callers should retry from scratch.
     Conflict,
-    /// A lock was poisoned or otherwise could not be acquired. Happens when several traversals mutate the properties of the same vertex/edge in parallel.
+    /// A lock was poisoned or otherwise could not be acquired. Happens when several traversals mutate the properties
+    /// of the same vertex/edge in parallel.
     LockError,
+    DuplicateVertex(VertexKey),
+    DuplicateEdge(CanonicalEdgeKey),
     Io(std::io::Error),
     Other(String),
 }
@@ -35,6 +40,8 @@ impl fmt::Display for StoreError {
             StoreError::NotFound => write!(f, "key not found"),
             StoreError::Conflict => write!(f, "transaction conflict; retry"),
             StoreError::LockError => write!(f, "lock error"),
+            StoreError::DuplicateVertex(key) => write!(f, "duplicate vertex: {key}"),
+            StoreError::DuplicateEdge(key) => write!(f, "duplicate edge: {key}"),
             StoreError::Io(e) => write!(f, "I/O error: {e}"),
             StoreError::Other(msg) => write!(f, "{msg}"),
         }

@@ -318,7 +318,13 @@ mod tests {
     fn make_edge(cek: CanonicalEdgeKey, raw: &[(PropKey, Primitive)]) -> FullEdge {
         let owner = CanonicalKey::Edge(cek);
         let props = raw.iter().map(|(k, v)| Property { owner, key: k.clone(), value: v.clone() }).collect();
-        FullEdge { src_id: cek.src_id, label_id: cek.label_id, rank: cek.rank, dst_id: cek.dst_id, props: RwLock::new(props) }
+        FullEdge {
+            src_id: cek.src_id,
+            label_id: cek.label_id,
+            rank: cek.rank,
+            dst_id: cek.dst_id,
+            props: RwLock::new(props),
+        }
     }
 
     // ── VertexKey ─────────────────────────────────────────────────────────────
