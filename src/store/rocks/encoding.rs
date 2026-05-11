@@ -143,31 +143,37 @@ pub fn decode_edge_key_in(bytes: &[u8]) -> Option<CanonicalEdgeKey> {
 
 // ── VertexValue ───────────────────────────────────────────────────────────────
 
-/// `[ label_id:u16 | property_blob ]` — value in the `vertices` CF.
+/// `[ label_id:u16 | out_e_cnt:u32 | in_e_cnt:u32 | property_blob ]` — value in the `vertices` CF.
 ///
 /// The label string is NOT stored here; `label_id` is resolved to a string
 /// via the process-wide `Schema` when needed.
 #[derive(Debug, Clone)]
 pub struct VertexValue {
     pub label_id: LabelId,
+    pub out_e_cnt: u32,
+    pub in_e_cnt: u32,
     pub property_blob: Vec<u8>,
 }
 
 impl VertexValue {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(2 + self.property_blob.len());
+        let mut buf = Vec::with_capacity(10 + self.property_blob.len());
         buf.extend_from_slice(&self.label_id.to_be_bytes());
+        buf.extend_from_slice(&self.out_e_cnt.to_be_bytes());
+        buf.extend_from_slice(&self.in_e_cnt.to_be_bytes());
         buf.extend_from_slice(&self.property_blob);
         buf
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 2 {
+        if bytes.len() < 10 {
             return None;
         }
         let label_id = u16::from_be_bytes(bytes[0..2].try_into().ok()?);
-        let property_blob = bytes[2..].to_vec();
-        Some(Self { label_id, property_blob })
+        let out_e_cnt = u32::from_be_bytes(bytes[2..6].try_into().ok()?);
+        let in_e_cnt = u32::from_be_bytes(bytes[6..10].try_into().ok()?);
+        let property_blob = bytes[10..].to_vec();
+        Some(Self { label_id, out_e_cnt, in_e_cnt, property_blob })
     }
 }
 
@@ -194,14 +200,16 @@ impl EdgeValue {
 #[cfg(test)]
 mod tests {
     use smol_str::SmolStr;
-    use std::sync::RwLock;
+    use std::sync::{atomic::AtomicU32, RwLock};
 
     use super::{
         decode_edge_key_in, decode_edge_key_out, decode_vertex_key, encode_edge_key_in, encode_edge_key_out,
         encode_vertex_key, EdgeValue, VertexValue,
     };
-    use crate::types::full_element::{FullEdge, FullVertex};
-    use crate::types::{CanonicalEdgeKey, CanonicalKey, Primitive, PropKey, Property, StoreError};
+    use crate::types::{
+        element::{Edge, Vertex},
+        CanonicalEdgeKey, CanonicalKey, Primitive, PropKey, Property, StoreError,
+    };
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -309,16 +317,22 @@ mod tests {
         out
     }
 
-    fn make_vertex(id: u64, label_id: u16, raw: &[(PropKey, Primitive)]) -> FullVertex {
+    fn make_vertex(id: u64, label_id: u16, out_e_cnt: u32, in_e_cnt: u32, raw: &[(PropKey, Primitive)]) -> Vertex {
         let owner = CanonicalKey::Vertex(id);
         let props = raw.iter().map(|(k, v)| Property { owner, key: k.clone(), value: v.clone() }).collect();
-        FullVertex { id, label_id, props: RwLock::new(props) }
+        Vertex {
+            id,
+            label_id,
+            out_e_cnt: AtomicU32::new(out_e_cnt),
+            in_e_cnt: AtomicU32::new(in_e_cnt),
+            props: RwLock::new(props),
+        }
     }
 
-    fn make_edge(cek: CanonicalEdgeKey, raw: &[(PropKey, Primitive)]) -> FullEdge {
+    fn make_edge(cek: CanonicalEdgeKey, raw: &[(PropKey, Primitive)]) -> Edge {
         let owner = CanonicalKey::Edge(cek);
         let props = raw.iter().map(|(k, v)| Property { owner, key: k.clone(), value: v.clone() }).collect();
-        FullEdge {
+        Edge {
             src_id: cek.src_id,
             label_id: cek.label_id,
             rank: cek.rank,
@@ -377,10 +391,12 @@ mod tests {
             (SmolStr::new("name"), Primitive::String(SmolStr::new("Alice"))),
             (SmolStr::new("age"), Primitive::Int32(30)),
         ];
-        let vv = VertexValue { label_id: 7, property_blob: encode_props(&raw) };
+        let vv = VertexValue { label_id: 7, out_e_cnt: 10, in_e_cnt: 20, property_blob: encode_props(&raw) };
         let bytes = vv.encode();
         let dec = VertexValue::decode(&bytes).unwrap();
         assert_eq!(dec.label_id, 7);
+        assert_eq!(dec.out_e_cnt, 10);
+        assert_eq!(dec.in_e_cnt, 20);
         let props = decode_props(&dec.property_blob);
         assert_eq!(props.len(), 2);
         assert_eq!(props[0].0, SmolStr::new("name"));
@@ -390,7 +406,7 @@ mod tests {
 
     #[test]
     fn vertex_value_decode_bad_length() {
-        assert!(VertexValue::decode(&[0u8; 1]).is_none());
+        assert!(VertexValue::decode(&[0u8; 9]).is_none());
         assert!(VertexValue::decode(&[]).is_none());
     }
 
@@ -403,13 +419,14 @@ mod tests {
             (SmolStr::new("score"), Primitive::Float64(9.9)),
         ];
         let key_bytes = encode_vertex_key(42);
-        let val_bytes = VertexValue { label_id: 1, property_blob: encode_props(&raw) }.encode();
+        let val_bytes =
+            VertexValue { label_id: 1, out_e_cnt: 5, in_e_cnt: 8, property_blob: encode_props(&raw) }.encode();
         let id = decode_vertex_key(&key_bytes).unwrap();
         let vv = VertexValue::decode(&val_bytes).unwrap();
         assert_eq!(id, 42);
         assert_eq!(vv.label_id, 1);
         let dec_props = decode_props(&vv.property_blob);
-        let fv = make_vertex(id, vv.label_id, &dec_props);
+        let fv = make_vertex(id, vv.label_id, vv.out_e_cnt, vv.in_e_cnt, &dec_props);
         assert_eq!(fv.id, 42);
         assert_eq!(fv.label_id, 1);
         let props_guard = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
@@ -468,7 +485,7 @@ mod tests {
         let props_guard = fe.props.write().map_err(|_| StoreError::LockError).unwrap();
         assert_eq!(props_guard[0].owner, CanonicalKey::Edge(cek));
 
-        let fv = make_vertex(99, 2, &[(SmolStr::new("x"), Primitive::Int32(7))]);
+        let fv = make_vertex(99, 2, 0, 0, &[(SmolStr::new("x"), Primitive::Int32(7))]);
         let props_guard = fv.props.write().map_err(|_| StoreError::LockError).unwrap();
         assert_eq!(props_guard[0].owner, CanonicalKey::Vertex(99));
     }

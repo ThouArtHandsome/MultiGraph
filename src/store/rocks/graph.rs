@@ -23,19 +23,27 @@
 //! Tags: `0`=Bool(1B) `1`=Int32(4B) `2`=Int64(8B) `3`=Float32(4B)
 //!       `4`=Float64(8B) `5`=String(len:u16 + UTF-8) `6`=Uuid(16B) `7`=Null(0B)
 
-use std::collections::HashSet;
-use std::sync::RwLock;
+use std::{
+    collections::HashSet,
+    sync::{atomic::AtomicU32, RwLock},
+};
 
 use rocksdb::{Direction as ScanDir, IteratorMode, ReadOptions, WriteBatchWithTransaction};
 
-use crate::store::rocks::encoding::{
-    decode_edge_key_in, decode_edge_key_out, edge_scan_prefix, encode_edge_key_in, encode_edge_key_out,
-    encode_vertex_key, prefix_upper_bound, EdgeValue, VertexValue, CF_EDGES_IN, CF_EDGES_OUT, CF_VERTICES,
+use crate::{
+    store::rocks::{
+        encoding::{
+            decode_edge_key_in, decode_edge_key_out, edge_scan_prefix, encode_edge_key_in, encode_edge_key_out,
+            encode_vertex_key, prefix_upper_bound, EdgeValue, VertexValue, CF_EDGES_IN, CF_EDGES_OUT, CF_VERTICES,
+        },
+        store::RocksStorage,
+    },
+    types::{
+        gvalue::{Primitive, Property},
+        prop_key::PropKey,
+        CanonicalEdgeKey, CanonicalKey, Direction, Edge, LabelId, StoreError, Vertex, VertexKey,
+    },
 };
-use crate::store::rocks::store::RocksStorage;
-use crate::types::gvalue::{Primitive, Property};
-use crate::types::prop_key::PropKey;
-use crate::types::{CanonicalEdgeKey, CanonicalKey, Direction, FullEdge, FullVertex, LabelId, StoreError, VertexKey};
 
 #[allow(dead_code)]
 type EdgeKeyDecoder = fn(&[u8]) -> Option<CanonicalEdgeKey>;
@@ -186,20 +194,26 @@ pub(super) fn decode_props(blob: &[u8], owner: CanonicalKey) -> Option<Vec<Prope
 
 // ── Element builders ──────────────────────────────────────────────────────────
 
-/// Decode a `VertexValue` from storage into a `FullVertex`.
-pub(super) fn build_full_vertex(id: VertexKey, vv: &VertexValue) -> Result<FullVertex, StoreError> {
+/// Decode a `VertexValue` from storage into a `Vertex`.
+pub(super) fn build_full_vertex(id: VertexKey, vv: &VertexValue) -> Result<Vertex, StoreError> {
     let owner = CanonicalKey::Vertex(id);
     let props = decode_props(&vv.property_blob, owner)
         .ok_or_else(|| StoreError::Other("corrupt vertex property blob".into()))?;
-    Ok(FullVertex { id, label_id: vv.label_id, props: RwLock::new(props) })
+    Ok(Vertex {
+        id,
+        label_id: vv.label_id,
+        out_e_cnt: AtomicU32::new(vv.out_e_cnt),
+        in_e_cnt: AtomicU32::new(vv.in_e_cnt),
+        props: RwLock::new(props),
+    })
 }
 
-/// Decode an `EdgeValue` from storage into an `FullEdge`.
-pub(super) fn build_full_edge(cek: CanonicalEdgeKey, ev: &EdgeValue) -> Result<FullEdge, StoreError> {
+/// Decode an `EdgeValue` from storage into an `Edge`.
+pub(super) fn build_full_edge(cek: CanonicalEdgeKey, ev: &EdgeValue) -> Result<Edge, StoreError> {
     let owner = CanonicalKey::Edge(cek);
     let props =
         decode_props(&ev.property_blob, owner).ok_or_else(|| StoreError::Other("corrupt edge property blob".into()))?;
-    Ok(FullEdge {
+    Ok(Edge {
         src_id: cek.src_id,
         label_id: cek.label_id,
         rank: cek.rank,
@@ -214,7 +228,7 @@ pub(super) fn build_full_edge(cek: CanonicalEdgeKey, ev: &EdgeValue) -> Result<F
 // non-test compilation.  The suppression is intentional.
 #[allow(dead_code)]
 impl RocksStorage {
-    pub(crate) fn get_vertex(&self, key: VertexKey) -> Result<Option<FullVertex>, StoreError> {
+    pub(crate) fn get_vertex(&self, key: VertexKey) -> Result<Option<Vertex>, StoreError> {
         let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
         match self.db.get_cf(&cf, encode_vertex_key(key)).map_err(|e| StoreError::Other(e.to_string()))? {
             None => Ok(None),
@@ -225,7 +239,7 @@ impl RocksStorage {
         }
     }
 
-    pub(crate) fn get_vertices(&self, keys: &[VertexKey]) -> Result<Vec<FullVertex>, StoreError> {
+    pub(crate) fn get_vertices(&self, keys: &[VertexKey]) -> Result<Vec<Vertex>, StoreError> {
         let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
         let mut result = Vec::with_capacity(keys.len());
         for &key in keys {
@@ -241,9 +255,13 @@ impl RocksStorage {
         Ok(result)
     }
 
-    pub(crate) fn get_edge(&self, key: CanonicalEdgeKey) -> Result<Option<FullEdge>, StoreError> {
-        let cf = self.db.cf_handle(CF_EDGES_OUT).ok_or_else(|| StoreError::Other("missing CF: edges_out".into()))?;
-        match self.db.get_cf(&cf, encode_edge_key_out(key)).map_err(|e| StoreError::Other(e.to_string()))? {
+    pub(crate) fn get_edge(&self, key: CanonicalEdgeKey, direction: Direction) -> Result<Option<Edge>, StoreError> {
+        let (cf_name, key_bytes) = match direction {
+            Direction::OUT => (CF_EDGES_OUT, encode_edge_key_out(key)),
+            Direction::IN => (CF_EDGES_IN, encode_edge_key_in(key)),
+        };
+        let cf = self.db.cf_handle(cf_name).ok_or_else(|| StoreError::Other(format!("missing CF: {cf_name}")))?;
+        match self.db.get_cf(&cf, key_bytes).map_err(|e| StoreError::Other(e.to_string()))? {
             None => Ok(None),
             Some(raw) => Ok(Some(build_full_edge(key, &EdgeValue::decode(&raw))?)),
         }
@@ -255,7 +273,7 @@ impl RocksStorage {
         direction: Direction,
         label: Option<LabelId>,
         dst: Option<&[VertexKey]>,
-    ) -> Result<Vec<FullEdge>, StoreError> {
+    ) -> Result<Vec<Edge>, StoreError> {
         let (cf_name, decode_fn): (&str, EdgeKeyDecoder) = match direction {
             Direction::OUT => (CF_EDGES_OUT, decode_edge_key_out),
             Direction::IN => (CF_EDGES_IN, decode_edge_key_in),
@@ -297,28 +315,38 @@ impl RocksStorage {
     // `OptimisticTransactionDB::write()` requires this type; using the plain
     // `WriteBatch` (TRANSACTION=false) is a compile-time type mismatch.
 
-    pub(crate) fn insert_vertices(&mut self, vertices: &[FullVertex]) -> Result<(), StoreError> {
+    pub(crate) fn insert_vertices(&mut self, vertices: &[Vertex]) -> Result<(), StoreError> {
         let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
         let mut batch = WriteBatchWithTransaction::<true>::default();
         for vv in vertices {
             let guard_props = vv.props.read().map_err(|_| StoreError::LockError)?;
-            let val = VertexValue { label_id: vv.label_id, property_blob: encode_props(&guard_props) };
+            let val = VertexValue {
+                label_id: vv.label_id,
+                out_e_cnt: vv.out_e_cnt.load(std::sync::atomic::Ordering::Relaxed),
+                in_e_cnt: vv.in_e_cnt.load(std::sync::atomic::Ordering::Relaxed),
+                property_blob: encode_props(&guard_props),
+            };
             batch.put_cf(&cf, encode_vertex_key(vv.id), val.encode());
         }
         self.db.write(batch).map_err(|e| StoreError::Other(e.to_string()))
     }
 
-    pub(crate) fn insert_edges(&mut self, edges: &[FullEdge]) -> Result<(), StoreError> {
-        let cf_out =
-            self.db.cf_handle(CF_EDGES_OUT).ok_or_else(|| StoreError::Other("missing CF: edges_out".into()))?;
-        let cf_in = self.db.cf_handle(CF_EDGES_IN).ok_or_else(|| StoreError::Other("missing CF: edges_in".into()))?;
+    pub(crate) fn insert_edges(&mut self, edges: &[Edge], direction: Direction) -> Result<(), StoreError> {
+        let cf_name = match direction {
+            Direction::OUT => CF_EDGES_OUT,
+            Direction::IN => CF_EDGES_IN,
+        };
+        let cf = self.db.cf_handle(cf_name).ok_or_else(|| StoreError::Other(format!("missing CF: {cf_name}")))?;
         let mut batch = WriteBatchWithTransaction::<true>::default();
         for ev in edges {
             let cek = ev.canonical_key();
+            let key_bytes = match direction {
+                Direction::OUT => encode_edge_key_out(cek),
+                Direction::IN => encode_edge_key_in(cek),
+            };
             let guard_props = ev.props.read().map_err(|_| StoreError::LockError)?;
             let bytes = EdgeValue { property_blob: encode_props(&guard_props) }.encode().to_vec();
-            batch.put_cf(&cf_out, encode_edge_key_out(cek), &bytes);
-            batch.put_cf(&cf_in, encode_edge_key_in(cek), &bytes);
+            batch.put_cf(&cf, key_bytes, &bytes);
         }
         self.db.write(batch).map_err(|e| StoreError::Other(e.to_string()))
     }
@@ -332,14 +360,19 @@ impl RocksStorage {
         self.db.write(batch).map_err(|e| StoreError::Other(e.to_string()))
     }
 
-    pub(crate) fn delete_edges(&mut self, keys: &[CanonicalEdgeKey]) -> Result<(), StoreError> {
-        let cf_out =
-            self.db.cf_handle(CF_EDGES_OUT).ok_or_else(|| StoreError::Other("missing CF: edges_out".into()))?;
-        let cf_in = self.db.cf_handle(CF_EDGES_IN).ok_or_else(|| StoreError::Other("missing CF: edges_in".into()))?;
+    pub(crate) fn delete_edges(&mut self, keys: &[CanonicalEdgeKey], direction: Direction) -> Result<(), StoreError> {
+        let cf_name = match direction {
+            Direction::OUT => CF_EDGES_OUT,
+            Direction::IN => CF_EDGES_IN,
+        };
+        let cf = self.db.cf_handle(cf_name).ok_or_else(|| StoreError::Other(format!("missing CF: {cf_name}")))?;
         let mut batch = WriteBatchWithTransaction::<true>::default();
         for &key in keys {
-            batch.delete_cf(&cf_out, encode_edge_key_out(key));
-            batch.delete_cf(&cf_in, encode_edge_key_in(key));
+            let key_bytes = match direction {
+                Direction::OUT => encode_edge_key_out(key),
+                Direction::IN => encode_edge_key_in(key),
+            };
+            batch.delete_cf(&cf, key_bytes);
         }
         self.db.write(batch).map_err(|e| StoreError::Other(e.to_string()))
     }
@@ -350,12 +383,16 @@ impl RocksStorage {
 #[cfg(test)]
 mod tests {
     use smol_str::SmolStr;
-    use std::sync::RwLock;
+    use std::sync::{atomic::AtomicU32, RwLock};
 
-    use crate::store::rocks::store::RocksStorage;
-    use crate::types::full_element::{FullEdge, FullVertex};
-    use crate::types::gvalue::{Primitive, Property};
-    use crate::types::{CanonicalEdgeKey, CanonicalKey, Direction, StoreError};
+    use crate::{
+        store::rocks::store::RocksStorage,
+        types::{
+            element::{Edge, Vertex},
+            gvalue::{Primitive, Property},
+            CanonicalEdgeKey, CanonicalKey, Direction, StoreError,
+        },
+    };
 
     fn open_temp_store() -> (RocksStorage, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -363,18 +400,20 @@ mod tests {
         (store, dir)
     }
 
-    fn make_vertex(id: u64, label_id: u16, props: Vec<(SmolStr, Primitive)>) -> FullVertex {
+    fn make_vertex(id: u64, label_id: u16, out_e_cnt: u32, in_e_cnt: u32, props: Vec<(SmolStr, Primitive)>) -> Vertex {
         let owner = CanonicalKey::Vertex(id);
-        FullVertex {
+        Vertex {
             id,
             label_id,
+            out_e_cnt: AtomicU32::new(out_e_cnt),
+            in_e_cnt: AtomicU32::new(in_e_cnt),
             props: RwLock::new(props.into_iter().map(|(k, v)| Property { owner, key: k, value: v }).collect()),
         }
     }
 
-    fn make_edge(cek: CanonicalEdgeKey, props: Vec<(SmolStr, Primitive)>) -> FullEdge {
+    fn make_edge(cek: CanonicalEdgeKey, props: Vec<(SmolStr, Primitive)>) -> Edge {
         let owner = CanonicalKey::Edge(cek);
-        FullEdge {
+        Edge {
             src_id: cek.src_id,
             label_id: cek.label_id,
             rank: cek.rank,
@@ -393,6 +432,8 @@ mod tests {
         let v = make_vertex(
             1,
             3,
+            0,
+            0,
             vec![
                 (SmolStr::new("name"), Primitive::String(SmolStr::new("Alice"))),
                 (SmolStr::new("age"), Primitive::Int32(30)),
@@ -420,7 +461,7 @@ mod tests {
     #[test]
     fn insert_vertex_with_no_props() {
         let (mut store, _dir) = open_temp_store();
-        store.insert_vertices(&[make_vertex(42, 1, vec![])]).unwrap();
+        store.insert_vertices(&[make_vertex(42, 1, 0, 0, vec![])]).unwrap();
         let fv = store.get_vertex(42).unwrap().unwrap();
         assert_eq!(fv.label_id, 1);
         let fv_props = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
@@ -430,19 +471,26 @@ mod tests {
     #[test]
     fn insert_vertex_overwrite_updates_value() {
         let (mut store, _dir) = open_temp_store();
-        store.insert_vertices(&[make_vertex(1, 1, vec![(SmolStr::new("age"), Primitive::Int32(20))])]).unwrap();
-        store.insert_vertices(&[make_vertex(1, 2, vec![(SmolStr::new("age"), Primitive::Int32(99))])]).unwrap();
+        store.insert_vertices(&[make_vertex(1, 1, 0, 0, vec![(SmolStr::new("age"), Primitive::Int32(20))])]).unwrap();
+        store.insert_vertices(&[make_vertex(1, 2, 5, 2, vec![(SmolStr::new("age"), Primitive::Int32(99))])]).unwrap();
         let fv = store.get_vertex(1).unwrap().unwrap();
         assert_eq!(fv.label_id, 2);
         let fv_props = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
         assert_eq!(fv_props[0].value, Primitive::Int32(99));
+
+        assert_eq!(fv.out_e_cnt.load(std::sync::atomic::Ordering::Relaxed), 5);
+        assert_eq!(fv.in_e_cnt.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]
     fn get_vertices_returns_all_inserted() {
         let (mut store, _dir) = open_temp_store();
         store
-            .insert_vertices(&[make_vertex(1, 1, vec![]), make_vertex(2, 1, vec![]), make_vertex(3, 2, vec![])])
+            .insert_vertices(&[
+                make_vertex(1, 1, 0, 0, vec![]),
+                make_vertex(2, 1, 0, 0, vec![]),
+                make_vertex(3, 2, 0, 0, vec![]),
+            ])
             .unwrap();
         let results = store.get_vertices(&[1, 2, 3]).unwrap();
         assert_eq!(results.len(), 3);
@@ -454,7 +502,7 @@ mod tests {
     #[test]
     fn get_vertices_silently_omits_missing_keys() {
         let (mut store, _dir) = open_temp_store();
-        store.insert_vertices(&[make_vertex(10, 1, vec![])]).unwrap();
+        store.insert_vertices(&[make_vertex(10, 1, 0, 0, vec![])]).unwrap();
         let results = store.get_vertices(&[10, 20, 30]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 10);
@@ -470,7 +518,9 @@ mod tests {
     fn insert_edge_readable_out() {
         let (mut store, _dir) = open_temp_store();
         let k = cek(1, 5, 2);
-        store.insert_edges(&[make_edge(k, vec![(SmolStr::new("weight"), Primitive::Float64(1.5))])]).unwrap();
+        store
+            .insert_edges(&[make_edge(k, vec![(SmolStr::new("weight"), Primitive::Float64(1.5))])], Direction::OUT)
+            .unwrap();
         let edges = store.get_edges(1, Direction::OUT, None, None).unwrap();
         assert_eq!(edges.len(), 1);
         let fe = &edges[0];
@@ -485,7 +535,7 @@ mod tests {
     #[test]
     fn insert_edge_readable_in() {
         let (mut store, _dir) = open_temp_store();
-        store.insert_edges(&[make_edge(cek(1, 5, 2), vec![])]).unwrap();
+        store.insert_edges(&[make_edge(cek(1, 5, 2), vec![])], Direction::IN).unwrap();
         let edges = store.get_edges(2, Direction::IN, None, None).unwrap();
         assert_eq!(edges.len(), 1);
         let fe = &edges[0];
@@ -498,11 +548,10 @@ mod tests {
     fn get_edges_filter_by_label() {
         let (mut store, _dir) = open_temp_store();
         store
-            .insert_edges(&[
-                make_edge(cek(1, 1, 10), vec![]),
-                make_edge(cek(1, 2, 20), vec![]),
-                make_edge(cek(1, 1, 30), vec![]),
-            ])
+            .insert_edges(
+                &[make_edge(cek(1, 1, 10), vec![]), make_edge(cek(1, 2, 20), vec![]), make_edge(cek(1, 1, 30), vec![])],
+                Direction::OUT,
+            )
             .unwrap();
         let label1 = store.get_edges(1, Direction::OUT, Some(1), None).unwrap();
         assert_eq!(label1.len(), 2);
@@ -516,11 +565,10 @@ mod tests {
     fn get_edges_filter_by_dst() {
         let (mut store, _dir) = open_temp_store();
         store
-            .insert_edges(&[
-                make_edge(cek(1, 1, 10), vec![]),
-                make_edge(cek(1, 1, 20), vec![]),
-                make_edge(cek(1, 1, 30), vec![]),
-            ])
+            .insert_edges(
+                &[make_edge(cek(1, 1, 10), vec![]), make_edge(cek(1, 1, 20), vec![]), make_edge(cek(1, 1, 30), vec![])],
+                Direction::OUT,
+            )
             .unwrap();
         let result = store.get_edges(1, Direction::OUT, None, Some(&[10, 30])).unwrap();
         assert_eq!(result.len(), 2);
@@ -540,12 +588,15 @@ mod tests {
     fn get_edges_multiple_from_same_source() {
         let (mut store, _dir) = open_temp_store();
         store
-            .insert_edges(&[
-                make_edge(cek(1, 1, 10), vec![]),
-                make_edge(cek(1, 1, 20), vec![]),
-                make_edge(cek(1, 1, 30), vec![]),
-                make_edge(cek(2, 1, 10), vec![]),
-            ])
+            .insert_edges(
+                &[
+                    make_edge(cek(1, 1, 10), vec![]),
+                    make_edge(cek(1, 1, 20), vec![]),
+                    make_edge(cek(1, 1, 30), vec![]),
+                    make_edge(cek(2, 1, 10), vec![]),
+                ],
+                Direction::OUT,
+            )
             .unwrap();
         let edges = store.get_edges(1, Direction::OUT, None, None).unwrap();
         assert_eq!(edges.len(), 3);

@@ -10,14 +10,18 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::{
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use indexmap::IndexMap;
 use smol_str::SmolStr;
 
-use crate::types::keys::{CanonicalKey, EdgeKey, VertexKey};
-use crate::types::prop_key::PropKey;
+use crate::types::{
+    keys::{CanonicalKey, EdgeKey, VertexKey},
+    prop_key::PropKey,
+};
 
 // ── Primitive ────────────────────────────────────────────────────────────────
 
@@ -95,7 +99,7 @@ impl Hash for Property {
 ///
 /// `Vertex` wraps a `VertexKey`; `Edge` wraps an `EdgeKey` (direction-aware).
 /// The engine calls `ctx.get_vertex(key)` / `ctx.get_edges(…)` to obtain
-/// `&FullVertex` / `&FullEdge` references when it needs property data.
+/// `Arc<Vertex>` / `Arc<Edge>` references when it needs property data.
 ///
 /// Both key types are `Copy` (8 / 24 bytes), so `GValue` is cheap to clone.
 #[derive(Debug, Clone)]

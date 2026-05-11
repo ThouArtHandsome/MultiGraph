@@ -10,15 +10,15 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
+pub mod element;
 pub mod error;
-pub mod full_element;
 pub mod gvalue;
 pub mod keys;
 pub mod label;
 pub mod prop_key;
 
+pub use element::{Edge, Vertex};
 pub use error::StoreError;
-pub use full_element::{FullEdge, FullVertex};
 pub use gvalue::{GValue, Primitive, Property};
 pub use keys::{CanonicalEdgeKey, CanonicalKey, Direction, EdgeKey, LabelId, Rank, VertexKey};
 pub use label::Label;

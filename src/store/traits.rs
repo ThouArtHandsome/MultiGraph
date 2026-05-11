@@ -30,7 +30,6 @@
 //!
 //! GraphStore
 //!   begin()  → fresh GraphTransaction
-//!   id_gen() → shared VertexKey allocator
 //! ```
 //!
 //! The engine never imports `GraphTransaction` or `GraphStore` directly —
@@ -39,9 +38,7 @@
 
 use std::sync::Arc;
 
-use crate::store::id_gen::IdGen;
-use crate::types::gvalue::Property;
-use crate::types::{CanonicalEdgeKey, Direction, FullEdge, FullVertex, LabelId, StoreError, VertexKey};
+use crate::types::{gvalue::Property, CanonicalEdgeKey, Direction, Edge, LabelId, StoreError, Vertex, VertexKey};
 
 // ── GraphTransaction ──────────────────────────────────────────────────────────
 
@@ -52,16 +49,17 @@ use crate::types::{CanonicalEdgeKey, Direction, FullEdge, FullVertex, LabelId, S
 ///
 /// # Read semantics
 ///
-/// Reads return `Arc<Full...>` so the shared process-wide vertex cache can
-/// hand out cheap clones without copying property data.  `GraphContext`
-/// stores the Arcs in its overlay; on mutation it uses `Arc::make_mut` for
-/// copy-on-write semantics.
+/// Reads return `Arc<Full...>` so the engine can easily hold onto references.
+/// `GraphContext` stores the Arcs in its overlay; on mutation it acquires a write
+/// lock on the properties `RwLock` for in-place updates.
 ///
 /// # Write semantics
 ///
-/// Writes are raw: `GraphContext` passes explicit keys (allocated via
-/// `GraphStore::id_gen`) and full property lists.  The transaction stages
-/// them and flushes atomically on `commit`.
+/// Writes are purely physical: `GraphTransaction` writes exactly what it is told
+/// and operates on individual records. It does not enforce graph consistency
+/// (e.g., maintaining matching Out and In edge records, updating vertex edge
+/// counts, or checking for dangling edges). That graph-level consistency is
+/// strictly the responsibility of `GraphContext`.
 pub trait GraphTransaction {
     // ── Reads ─────────────────────────────────────────────────────────────────
 
@@ -69,10 +67,14 @@ pub trait GraphTransaction {
     ///
     /// Implementations should register the key in an OCC read-set so that a
     /// concurrent write detected at commit time returns `StoreError::Conflict`.
-    fn get_vertex(&mut self, key: VertexKey) -> Result<Option<Arc<FullVertex>>, StoreError>;
+    // TODO: Consider adding a batch `get_vertices` method to optimize bulk property retrieval.
+    // Currently, `get_vertex` is used both for property loading and existence checking.
+    // A batch API would be great for data fetching, but returning a partial result set makes it
+    // inconvenient for strict existence checks. Needs further design consideration.
+    fn get_vertex(&mut self, key: VertexKey) -> Result<Option<Arc<Vertex>>, StoreError>;
 
-    /// Fetch a committed edge by canonical key; `None` if absent.
-    fn get_edge(&mut self, key: CanonicalEdgeKey) -> Result<Option<Arc<FullEdge>>, StoreError>;
+    /// Fetch a single committed edge record for the given direction; `None` if absent.
+    fn get_edge(&mut self, key: CanonicalEdgeKey, direction: Direction) -> Result<Option<Arc<Edge>>, StoreError>;
 
     /// Scan committed edges incident to `vertex` in `direction`.
     ///
@@ -84,21 +86,28 @@ pub trait GraphTransaction {
         direction: Direction,
         label: Option<LabelId>,
         dst: Option<&[VertexKey]>,
-    ) -> Result<Vec<Arc<FullEdge>>, StoreError>;
+    ) -> Result<Vec<Arc<Edge>>, StoreError>;
 
     // ── Writes ────────────────────────────────────────────────────────────────
 
     /// Upsert a vertex record with explicit key, label, and full property list.
-    fn put_vertex(&mut self, key: VertexKey, label_id: LabelId, props: &[Property]) -> Result<(), StoreError>;
+    fn put_vertex(
+        &mut self,
+        key: VertexKey,
+        label_id: LabelId,
+        out_e_cnt: u32,
+        in_e_cnt: u32,
+        props: &[Property],
+    ) -> Result<(), StoreError>;
 
-    /// Upsert an edge record (both physical CF entries) with its property list.
-    fn put_edge(&mut self, key: CanonicalEdgeKey, props: &[Property]) -> Result<(), StoreError>;
+    /// Upsert a single edge record in the specified physical direction index.
+    fn put_edge(&mut self, key: CanonicalEdgeKey, direction: Direction, props: &[Property]) -> Result<(), StoreError>;
 
     /// Delete a vertex record.
     fn delete_vertex(&mut self, key: VertexKey) -> Result<(), StoreError>;
 
-    /// Delete an edge record (both physical CF entries).
-    fn delete_edge(&mut self, key: CanonicalEdgeKey) -> Result<(), StoreError>;
+    /// Delete a single edge record from the specified physical direction index.
+    fn delete_edge(&mut self, key: CanonicalEdgeKey, direction: Direction) -> Result<(), StoreError>;
 
     // ── Control ───────────────────────────────────────────────────────────────
 
@@ -125,10 +134,4 @@ pub trait GraphStore {
 
     /// Begin a fresh transaction.
     fn begin(&self) -> Self::Txn;
-
-    /// Return the shared vertex-ID allocator.
-    ///
-    /// `GraphContext` uses this to assign keys to newly created vertices
-    /// before staging them via `put_vertex`.
-    fn id_gen(&self) -> Arc<IdGen>;
 }

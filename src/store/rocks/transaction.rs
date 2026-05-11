@@ -22,15 +22,16 @@
 //! # Read path
 //!
 //! `get_vertex` uses `GetForUpdate` to enrol the key in the OCC read-set.
-//! Edge reads use snapshot scans (no `GetForUpdate`); write-write conflicts
-//! for edges are detected automatically by the OCC at commit time because
-//! any modified edge key is in the write-set.
+//! Point edge reads (`get_edge`) also use `GetForUpdate`. Edge scans (`get_edges`)
+//! use snapshot scans; their write-write conflicts are detected automatically
+//! by the OCC at commit time because any modified edge key is in the write-set.
 //!
 //! # Write path
 //!
-//! `put_vertex` / `put_edge` encode and stage writes directly on `db_txn`.
-//! `delete_vertex` / `delete_edge` stage deletes.  All staged operations are
-//! flushed atomically by `commit`.
+//! This layer is physically pure: `put_edge` and `delete_edge` write or
+//! delete exactly one record (either `CF_EDGES_OUT` or `CF_EDGES_IN`). Graph
+//! consistency logic (like ensuring forward and backward edges exist) is
+//! entirely deferred to `GraphContext`. All staged operations are flushed atomically by `commit`.
 //!
 //! # Lifetime erasure
 //!
@@ -59,7 +60,7 @@ use crate::{
         },
         traits::GraphTransaction,
     },
-    types::{gvalue::Property, CanonicalEdgeKey, Direction, FullEdge, FullVertex, LabelId, StoreError, VertexKey},
+    types::{gvalue::Property, CanonicalEdgeKey, Direction, Edge, LabelId, StoreError, Vertex, VertexKey},
 };
 
 type EdgeKeyDecoder = fn(&[u8]) -> Option<CanonicalEdgeKey>;
@@ -108,7 +109,7 @@ impl Transaction {
 // ── GraphTransaction ──────────────────────────────────────────────────────────
 
 impl GraphTransaction for Transaction {
-    fn get_vertex(&mut self, key: VertexKey) -> Result<Option<Arc<FullVertex>>, StoreError> {
+    fn get_vertex(&mut self, key: VertexKey) -> Result<Option<Arc<Vertex>>, StoreError> {
         let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
         let raw_opt = self
             .db_txn
@@ -127,13 +128,17 @@ impl GraphTransaction for Transaction {
     }
 
     // TODO: do we need `GetForUpdate` for edges?
-    fn get_edge(&mut self, key: CanonicalEdgeKey) -> Result<Option<Arc<FullEdge>>, StoreError> {
-        let cf = self.db.cf_handle(CF_EDGES_OUT).ok_or_else(|| StoreError::Other("missing CF: edges_out".into()))?;
+    fn get_edge(&mut self, key: CanonicalEdgeKey, direction: Direction) -> Result<Option<Arc<Edge>>, StoreError> {
+        let (cf_name, key_bytes) = match direction {
+            Direction::OUT => (CF_EDGES_OUT, encode_edge_key_out(key)),
+            Direction::IN => (CF_EDGES_IN, encode_edge_key_in(key)),
+        };
+        let cf = self.db.cf_handle(cf_name).ok_or_else(|| StoreError::Other(format!("missing CF: {cf_name}")))?;
         let raw_opt = self
             .db_txn
             .as_ref()
             .expect("no active transaction")
-            .get_for_update_cf(&cf, encode_edge_key_out(key), false)
+            .get_for_update_cf(&cf, key_bytes, false)
             .map_err(|e| StoreError::Other(e.to_string()))?;
 
         match raw_opt {
@@ -148,7 +153,7 @@ impl GraphTransaction for Transaction {
         direction: Direction,
         label: Option<LabelId>,
         dst: Option<&[VertexKey]>,
-    ) -> Result<Vec<Arc<FullEdge>>, StoreError> {
+    ) -> Result<Vec<Arc<Edge>>, StoreError> {
         let (cf_name, decode_fn): (&str, EdgeKeyDecoder) = match direction {
             Direction::OUT => (CF_EDGES_OUT, decode_edge_key_out),
             Direction::IN => (CF_EDGES_IN, decode_edge_key_in),
@@ -187,9 +192,16 @@ impl GraphTransaction for Transaction {
         Ok(result)
     }
 
-    fn put_vertex(&mut self, key: VertexKey, label_id: LabelId, props: &[Property]) -> Result<(), StoreError> {
+    fn put_vertex(
+        &mut self,
+        key: VertexKey,
+        label_id: LabelId,
+        out_e_cnt: u32,
+        in_e_cnt: u32,
+        props: &[Property],
+    ) -> Result<(), StoreError> {
         let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
-        let vv = VertexValue { label_id, property_blob: encode_props(props) };
+        let vv = VertexValue { label_id, out_e_cnt, in_e_cnt, property_blob: encode_props(props) };
         self.db_txn
             .as_ref()
             .expect("no active transaction")
@@ -197,15 +209,15 @@ impl GraphTransaction for Transaction {
             .map_err(|e| StoreError::Other(e.to_string()))
     }
 
-    fn put_edge(&mut self, key: CanonicalEdgeKey, props: &[Property]) -> Result<(), StoreError> {
-        let cf_out =
-            self.db.cf_handle(CF_EDGES_OUT).ok_or_else(|| StoreError::Other("missing CF: edges_out".into()))?;
-        let cf_in = self.db.cf_handle(CF_EDGES_IN).ok_or_else(|| StoreError::Other("missing CF: edges_in".into()))?;
+    fn put_edge(&mut self, key: CanonicalEdgeKey, direction: Direction, props: &[Property]) -> Result<(), StoreError> {
+        let (cf_name, key_bytes) = match direction {
+            Direction::OUT => (CF_EDGES_OUT, encode_edge_key_out(key)),
+            Direction::IN => (CF_EDGES_IN, encode_edge_key_in(key)),
+        };
+        let cf = self.db.cf_handle(cf_name).ok_or_else(|| StoreError::Other(format!("missing CF: {cf_name}")))?;
         let ev_bytes = EdgeValue { property_blob: encode_props(props) }.encode().to_vec();
         let txn = self.db_txn.as_ref().expect("no active transaction");
-        txn.put_cf(&cf_out, encode_edge_key_out(key), &ev_bytes).map_err(|e| StoreError::Other(e.to_string()))?;
-        txn.put_cf(&cf_in, encode_edge_key_in(key), &ev_bytes).map_err(|e| StoreError::Other(e.to_string()))?;
-        Ok(())
+        txn.put_cf(&cf, key_bytes, &ev_bytes).map_err(|e| StoreError::Other(e.to_string()))
     }
 
     fn delete_vertex(&mut self, key: VertexKey) -> Result<(), StoreError> {
@@ -217,14 +229,14 @@ impl GraphTransaction for Transaction {
             .map_err(|e| StoreError::Other(e.to_string()))
     }
 
-    fn delete_edge(&mut self, key: CanonicalEdgeKey) -> Result<(), StoreError> {
-        let cf_out =
-            self.db.cf_handle(CF_EDGES_OUT).ok_or_else(|| StoreError::Other("missing CF: edges_out".into()))?;
-        let cf_in = self.db.cf_handle(CF_EDGES_IN).ok_or_else(|| StoreError::Other("missing CF: edges_in".into()))?;
+    fn delete_edge(&mut self, key: CanonicalEdgeKey, direction: Direction) -> Result<(), StoreError> {
+        let (cf_name, key_bytes) = match direction {
+            Direction::OUT => (CF_EDGES_OUT, encode_edge_key_out(key)),
+            Direction::IN => (CF_EDGES_IN, encode_edge_key_in(key)),
+        };
+        let cf = self.db.cf_handle(cf_name).ok_or_else(|| StoreError::Other(format!("missing CF: {cf_name}")))?;
         let txn = self.db_txn.as_ref().expect("no active transaction");
-        txn.delete_cf(&cf_out, encode_edge_key_out(key)).map_err(|e| StoreError::Other(e.to_string()))?;
-        txn.delete_cf(&cf_in, encode_edge_key_in(key)).map_err(|e| StoreError::Other(e.to_string()))?;
-        Ok(())
+        txn.delete_cf(&cf, key_bytes).map_err(|e| StoreError::Other(e.to_string()))
     }
 
     fn commit(&mut self) -> Result<(), StoreError> {

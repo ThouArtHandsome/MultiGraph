@@ -10,9 +10,14 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
-use crate::types::gvalue::Property;
-use crate::types::keys::{CanonicalEdgeKey, LabelId, Rank, VertexKey};
-use std::sync::RwLock;
+use crate::types::{
+    gvalue::Property,
+    keys::{CanonicalEdgeKey, LabelId, Rank, VertexKey},
+};
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    RwLock,
+};
 
 // ── FullVertex ────────────────────────────────────────────────────────────────
 
@@ -20,13 +25,17 @@ use std::sync::RwLock;
 ///
 /// Returned by `GraphTransaction::get_vertex` and stored inside `GraphContext`'s
 /// overlay.  The traversal engine accesses properties directly via
-/// `ctx.vertex(idx)` without copying or dereferencing an extra wrapper.
+/// `ctx.get_vertex(key)` without copying or dereferencing an extra wrapper.
 /// There is no `Existence` field — the store never returns tombstoned elements.
 #[derive(Debug)]
-pub struct FullVertex {
+pub struct Vertex {
     pub id: VertexKey,
     pub label_id: LabelId,
-    pub props: RwLock<Vec<Property>>, // Only this is mutable
+    /// Counter for outgoing edges, updated within the graph context.
+    pub out_e_cnt: AtomicU32,
+    /// Counter for incoming edges, updated within the graph context.
+    pub in_e_cnt: AtomicU32,
+    pub props: RwLock<Vec<Property>>, // Mutated via lock, while counters use atomic interior mutability
 }
 
 // ── FullEdge ──────────────────────────────────────────────────────────────────
@@ -38,7 +47,7 @@ pub struct FullVertex {
 ///
 /// TODO: haven't considered the property ordering implications of `Vec<Property>` yet.  If we need to support
 #[derive(Debug)]
-pub struct FullEdge {
+pub struct Edge {
     pub src_id: VertexKey,
     pub label_id: LabelId,
     pub rank: Rank,
@@ -46,17 +55,21 @@ pub struct FullEdge {
     pub props: RwLock<Vec<Property>>, // Only this is mutable
 }
 
-impl FullEdge {
+impl Edge {
     /// Extract the direction-free canonical key (same as the `edges_out` CF key).
     pub fn canonical_key(&self) -> CanonicalEdgeKey {
         CanonicalEdgeKey { src_id: self.src_id, label_id: self.label_id, rank: self.rank, dst_id: self.dst_id }
     }
 }
 
-impl PartialEq for FullVertex {
+impl PartialEq for Vertex {
     fn eq(&self, other: &Self) -> bool {
         // Compare basic fields
-        if self.id != other.id || self.label_id != other.label_id {
+        if self.id != other.id
+            || self.label_id != other.label_id
+            || self.out_e_cnt.load(Ordering::Relaxed) != other.out_e_cnt.load(Ordering::Relaxed)
+            || self.in_e_cnt.load(Ordering::Relaxed) != other.in_e_cnt.load(Ordering::Relaxed)
+        {
             return false;
         }
 
@@ -67,9 +80,9 @@ impl PartialEq for FullVertex {
     }
 }
 
-impl Eq for FullVertex {}
+impl Eq for Vertex {}
 
-impl PartialEq for FullEdge {
+impl PartialEq for Edge {
     fn eq(&self, other: &Self) -> bool {
         // Compare basic fields
         if self.src_id != other.src_id
@@ -87,4 +100,4 @@ impl PartialEq for FullEdge {
     }
 }
 
-impl Eq for FullEdge {}
+impl Eq for Edge {}
