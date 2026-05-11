@@ -12,6 +12,7 @@
 
 use crate::types::gvalue::Property;
 use crate::types::keys::{CanonicalEdgeKey, LabelId, Rank, VertexKey};
+use std::sync::RwLock;
 
 // ── FullVertex ────────────────────────────────────────────────────────────────
 
@@ -21,11 +22,11 @@ use crate::types::keys::{CanonicalEdgeKey, LabelId, Rank, VertexKey};
 /// overlay.  The traversal engine accesses properties directly via
 /// `ctx.vertex(idx)` without copying or dereferencing an extra wrapper.
 /// There is no `Existence` field — the store never returns tombstoned elements.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct FullVertex {
     pub id: VertexKey,
     pub label_id: LabelId,
-    pub props: Vec<Property>,
+    pub props: RwLock<Vec<Property>>, // Only this is mutable
 }
 
 // ── FullEdge ──────────────────────────────────────────────────────────────────
@@ -36,13 +37,13 @@ pub struct FullVertex {
 /// `EdgeKey` from `canonical_key()` plus the direction it requested.
 /// 
 /// TODO: haven't considered the property ordering implications of `Vec<Property>` yet.  If we need to support
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct FullEdge {
     pub src_id: VertexKey,
     pub label_id: LabelId,
     pub rank: Rank,
     pub dst_id: VertexKey,
-    pub props: Vec<Property>,
+    pub props: RwLock<Vec<Property>>, // Only this is mutable
 }
 
 impl FullEdge {
@@ -51,3 +52,35 @@ impl FullEdge {
         CanonicalEdgeKey { src_id: self.src_id, label_id: self.label_id, rank: self.rank, dst_id: self.dst_id }
     }
 }
+
+impl PartialEq for FullVertex {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare basic fields
+        if self.id != other.id || self.label_id != other.label_id {
+            return false;
+        }
+        
+        // Lock both sides to compare properties
+        let p1 = self.props.read().unwrap();
+        let p2 = other.props.read().unwrap();
+        *p1 == *p2
+    }
+}
+
+impl Eq for FullVertex {}
+
+impl PartialEq for FullEdge {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare basic fields
+        if self.src_id != other.src_id || self.label_id != other.label_id || self.rank != other.rank || self.dst_id != other.dst_id {
+            return false;
+        }
+        
+        // Lock both sides to compare properties
+        let p1 = self.props.read().unwrap();
+        let p2 = other.props.read().unwrap();
+        *p1 == *p2
+    }
+}
+
+impl Eq for FullEdge {}

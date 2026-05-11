@@ -63,6 +63,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use crate::store::id_gen::IdGen;
 use crate::store::traits::{GraphStore, GraphTransaction};
@@ -185,7 +186,7 @@ impl<S: GraphStore> GraphContext<S> {
     /// `id_gen`); the reference gives immediate read access within this context.
     pub fn add_vertex(&mut self, label_id: LabelId) -> (VertexKey, Arc<FullVertex>) {
         let id = self.id_gen.next_vertex_id();
-        self.vertices.insert(id, Arc::new(FullVertex { id, label_id, props: Vec::new() }));
+        self.vertices.insert(id, Arc::new(FullVertex { id, label_id, props: RwLock::new(Vec::new())}));
         self.dirty.insert(CanonicalKey::Vertex(id), Existence::New);
         (id, self.vertices[&id].clone())
     }
@@ -204,7 +205,7 @@ impl<S: GraphStore> GraphContext<S> {
             label_id: cek.label_id,
             rank: cek.rank,
             dst_id: cek.dst_id,
-            props: Vec::new(),
+            props: RwLock::new(Vec::new()),
         }));
         self.dirty.insert(CanonicalKey::Edge(cek), Existence::New);
         (cek.out_key(), self.edges[&cek].clone())
@@ -223,7 +224,14 @@ impl<S: GraphStore> GraphContext<S> {
                 }
                 match self.vertices.get_mut(&id) {
                     None => return Err(StoreError::Other(format!("vertex {id} not loaded"))),
-                    Some(arc) => upsert_prop(&mut Arc::make_mut(arc).props, key, prop, value),
+                    Some(arc) => {
+                        // 1. Acquire a write lock on the properties
+                        let mut props = arc.props.write().map_err(|_| StoreError::LockError)?;
+                        
+                        // 2. Modify in place. No cloning happens!
+                        upsert_prop(&mut props, key, prop, value);
+                        // upsert_prop(&mut Arc::make_mut(arc).props, key, prop, value),
+                    }
                 }
                 self.dirty.entry(key).or_insert(Existence::Modified);
             }
@@ -233,7 +241,10 @@ impl<S: GraphStore> GraphContext<S> {
                 }
                 match self.edges.get_mut(&cek) {
                     None => return Err(StoreError::Other("edge not loaded".into())),
-                    Some(arc) => upsert_prop(&mut Arc::make_mut(arc).props, key, prop, value),
+                    Some(arc) => {
+                        let mut props = arc.props.write().map_err(|_| StoreError::LockError)?;
+                        upsert_prop(&mut props, key, prop, value);
+                    }
                 }
                 self.dirty.entry(key).or_insert(Existence::Modified);
             }
@@ -250,7 +261,10 @@ impl<S: GraphStore> GraphContext<S> {
                 }
                 match self.vertices.get_mut(&id) {
                     None => return Err(StoreError::Other(format!("vertex {id} not loaded"))),
-                    Some(arc) => Arc::make_mut(arc).props.retain(|p| &p.key != prop),
+                    Some(arc) => {
+                        let mut props = arc.props.write().map_err(|_| StoreError::LockError)?;
+                        props.retain(|p| &p.key != prop);
+                    }
                 }
                 self.dirty.entry(key).or_insert(Existence::Modified);
             }
@@ -260,7 +274,10 @@ impl<S: GraphStore> GraphContext<S> {
                 }
                 match self.edges.get_mut(&cek) {
                     None => return Err(StoreError::Other("edge not loaded".into())),
-                    Some(arc) => Arc::make_mut(arc).props.retain(|p| &p.key != prop),
+                    Some(arc) => {
+                        let mut props = arc.props.write().map_err(|_| StoreError::LockError)?;
+                        props.retain(|p| &p.key != prop);
+                    }
                 }
                 self.dirty.entry(key).or_insert(Existence::Modified);
             }
@@ -304,14 +321,22 @@ impl<S: GraphStore> GraphContext<S> {
             match (key, existence) {
                 (CanonicalKey::Vertex(id), Existence::New | Existence::Modified) => {
                     let v = self.vertices.get(&id).expect("dirty vertex key not in vertices");
-                    self.store.put_vertex(id, v.label_id, &v.props)?;
+                    // 1. Acquire a read lock
+                    let props_guard = v.props.read().map_err(|_| StoreError::LockError)?;
+
+                    // 2. Pass the guard (it derefs to &Vec<Property>, which matches &[Property])
+                    self.store.put_vertex(id, v.label_id, &props_guard)?;
                 }
                 (CanonicalKey::Vertex(id), Existence::Tombstone) => {
                     self.store.delete_vertex(id)?;
                 }
                 (CanonicalKey::Edge(cek), Existence::New | Existence::Modified) => {
                     let e = self.edges.get(&cek).expect("dirty edge key not in edges");
-                    self.store.put_edge(cek, &e.props)?;
+                    // 1. Acquire a read lock
+                    let props_guard = e.props.read().map_err(|_| StoreError::LockError)?;
+
+                    // 2. Pass the guard (it derefs to &Vec<Property>, which matches &[Property])
+                    self.store.put_edge(cek, &props_guard)?;
                 }
                 (CanonicalKey::Edge(cek), Existence::Tombstone) => {
                     self.store.delete_edge(cek)?;
@@ -388,6 +413,7 @@ mod tests {
     use crate::store::traits::GraphStore;
 
     use crate::store::RocksStorage;
+    use crate::types::StoreError;
     use crate::types::gvalue::Primitive;
     use crate::types::keys::{CanonicalEdgeKey, CanonicalKey, Direction};
 
@@ -440,8 +466,10 @@ mod tests {
         let (store, _dir) = open();
         let mut c = ctx(&store);
         let k = cek(1, 5, 2);
-        let _ = c.add_edge(k);
+        let (key, fe) = c.add_edge(k);
         let result = c.get_edge(k).unwrap().unwrap();
+        assert_eq!(k.out_key(), key);
+        assert_eq!(result, fe);
         assert_eq!((result.src_id, result.label_id, result.dst_id), (1, 5, 2));
     }
 
@@ -451,14 +479,21 @@ mod tests {
     fn set_property_on_new_vertex_read_your_writes() {
         let (store, _dir) = open();
         let mut c = ctx(&store);
-        let (key, _) = c.add_vertex(1);
+        let (key, fv) = c.add_vertex(1);
 
         c.set_property(CanonicalKey::Vertex(key), SmolStr::new("age"), Primitive::Int32(42)).unwrap();
 
         let v = c.get_vertex(key).unwrap().unwrap();
-        assert_eq!(v.props.len(), 1);
-        assert_eq!(v.props[0].key, SmolStr::new("age"));
-        assert_eq!(v.props[0].value, Primitive::Int32(42));
+        let fv_props = v.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(fv_props.len(), 1);
+        assert_eq!(fv_props[0].key, SmolStr::new("age"));
+        assert_eq!(fv_props[0].value, Primitive::Int32(42));
+
+        assert!(Arc::ptr_eq(&fv, &v), "get_vertex should return the same Arc as add_vertex");
+        let fv_props = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(fv_props.len(), 1);
+        assert_eq!(fv_props[0].key, SmolStr::new("age"));
+        assert_eq!(fv_props[0].value, Primitive::Int32(42));
     }
 
     #[test]
@@ -471,8 +506,9 @@ mod tests {
         c.set_property(CanonicalKey::Vertex(key), SmolStr::new("x"), Primitive::Int32(2)).unwrap();
 
         let v = c.get_vertex(key).unwrap().unwrap();
-        assert_eq!(v.props.len(), 1);
-        assert_eq!(v.props[0].value, Primitive::Int32(2));
+        let v_props = v.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(v_props.len(), 1);
+        assert_eq!(v_props[0].value, Primitive::Int32(2));
     }
 
     #[test]
@@ -485,8 +521,9 @@ mod tests {
         c.set_property(CanonicalKey::Edge(k), SmolStr::new("w"), Primitive::Float64(1.5)).unwrap();
 
         let e = c.get_edge(k).unwrap().unwrap();
-        assert_eq!(e.props.len(), 1);
-        assert_eq!(e.props[0].value, Primitive::Float64(1.5));
+        let e_props = e.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(e_props.len(), 1);
+        assert_eq!(e_props[0].value, Primitive::Float64(1.5));
     }
 
     // ── drop_property ─────────────────────────────────────────────────────────
@@ -502,8 +539,9 @@ mod tests {
         c.drop_property(CanonicalKey::Vertex(key), &SmolStr::new("a")).unwrap();
 
         let v = c.get_vertex(key).unwrap().unwrap();
-        assert_eq!(v.props.len(), 1);
-        assert_eq!(v.props[0].key, SmolStr::new("b"));
+        let v_props = v.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(v_props.len(), 1);
+        assert_eq!(v_props[0].key, SmolStr::new("b"));
     }
 
     #[test]
@@ -512,7 +550,9 @@ mod tests {
         let mut c = ctx(&store);
         let (key, _) = c.add_vertex(1);
         c.drop_property(CanonicalKey::Vertex(key), &SmolStr::new("nonexistent")).unwrap();
-        assert!(c.get_vertex(key).unwrap().unwrap().props.is_empty());
+        let v = c.get_vertex(key).unwrap().unwrap();
+        let v_props = v.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert!(v_props.is_empty());
     }
 
     // ── drop_element ──────────────────────────────────────────────────────────
@@ -562,7 +602,9 @@ mod tests {
 
         let fv = store.get_vertex(id).unwrap().unwrap();
         assert_eq!(fv.label_id, 7);
-        assert_eq!(fv.props[0].value, Primitive::String(SmolStr::new("Alice")));
+        let fv_props = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(fv_props.len(), 1);
+        assert_eq!(fv_props[0].value, Primitive::String(SmolStr::new("Alice")));
     }
 
     #[test]
@@ -578,7 +620,10 @@ mod tests {
 
         let edges = store.get_edges(10, Direction::OUT, None, None).unwrap();
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].props[0].value, Primitive::Int32(99));
+        let e = &edges[0];
+        let e_props = e.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(e_props.len(), 1);
+        assert_eq!(e_props[0].value, Primitive::Int32(99));
     }
 
     #[test]

@@ -194,13 +194,14 @@ impl EdgeValue {
 #[cfg(test)]
 mod tests {
     use smol_str::SmolStr;
+    use std::sync::RwLock;
 
     use super::{
         decode_edge_key_in, decode_edge_key_out, decode_vertex_key, encode_edge_key_in, encode_edge_key_out,
         encode_vertex_key, EdgeValue, VertexValue,
     };
     use crate::types::full_element::{FullEdge, FullVertex};
-    use crate::types::{CanonicalEdgeKey, CanonicalKey, Primitive, PropKey, Property};
+    use crate::types::{CanonicalEdgeKey, CanonicalKey, Primitive, PropKey, Property, StoreError};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -311,13 +312,13 @@ mod tests {
     fn make_vertex(id: u64, label_id: u16, raw: &[(PropKey, Primitive)]) -> FullVertex {
         let owner = CanonicalKey::Vertex(id);
         let props = raw.iter().map(|(k, v)| Property { owner, key: k.clone(), value: v.clone() }).collect();
-        FullVertex { id, label_id, props }
+        FullVertex { id, label_id, props: RwLock::new(props) }
     }
 
     fn make_edge(cek: CanonicalEdgeKey, raw: &[(PropKey, Primitive)]) -> FullEdge {
         let owner = CanonicalKey::Edge(cek);
         let props = raw.iter().map(|(k, v)| Property { owner, key: k.clone(), value: v.clone() }).collect();
-        FullEdge { src_id: cek.src_id, label_id: cek.label_id, rank: cek.rank, dst_id: cek.dst_id, props }
+        FullEdge { src_id: cek.src_id, label_id: cek.label_id, rank: cek.rank, dst_id: cek.dst_id, props: RwLock::new(props) }
     }
 
     // ── VertexKey ─────────────────────────────────────────────────────────────
@@ -405,9 +406,10 @@ mod tests {
         let fv = make_vertex(id, vv.label_id, &dec_props);
         assert_eq!(fv.id, 42);
         assert_eq!(fv.label_id, 1);
-        assert_eq!(fv.props.len(), 2);
-        assert_eq!(fv.props[0].key, SmolStr::new("name"));
-        assert_eq!(fv.props[0].owner, CanonicalKey::Vertex(42));
+        let props_guard = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(props_guard.len(), 2);
+        assert_eq!(props_guard[0].key, SmolStr::new("name"));
+        assert_eq!(props_guard[0].owner, CanonicalKey::Vertex(42));
     }
 
     #[test]
@@ -427,8 +429,9 @@ mod tests {
         assert_eq!(fe.src_id, 10);
         assert_eq!(fe.dst_id, 20);
         assert_eq!(fe.label_id, 7);
-        assert_eq!(fe.props[0].owner, CanonicalKey::Edge(cek));
-        assert_eq!(fe.props[1].value, Primitive::String(SmolStr::new("friend")));
+        let props_guard = fe.props.write().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(props_guard[0].owner, CanonicalKey::Edge(cek));
+        assert_eq!(props_guard[1].value, Primitive::String(SmolStr::new("friend")));
     }
 
     #[test]
@@ -456,9 +459,11 @@ mod tests {
     fn property_owner_is_canonical_key() {
         let cek = CanonicalEdgeKey { src_id: 5, label_id: 1, rank: 0, dst_id: 6 };
         let fe = make_edge(cek, &[(SmolStr::new("w"), Primitive::Float32(0.5))]);
-        assert_eq!(fe.props[0].owner, CanonicalKey::Edge(cek));
+        let props_guard = fe.props.write().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(props_guard[0].owner, CanonicalKey::Edge(cek));
 
         let fv = make_vertex(99, 2, &[(SmolStr::new("x"), Primitive::Int32(7))]);
-        assert_eq!(fv.props[0].owner, CanonicalKey::Vertex(99));
+        let props_guard = fv.props.write().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(props_guard[0].owner, CanonicalKey::Vertex(99));
     }
 }

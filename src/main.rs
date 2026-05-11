@@ -32,6 +32,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use multigraph::types::error::StoreError;
     use multigraph::context::GraphContext;
     use multigraph::store::{GraphStore, RocksStorage};
     use multigraph::types::gvalue::Primitive;
@@ -53,11 +54,13 @@ mod tests {
     }
 
     fn prop(v: &multigraph::types::full_element::FullVertex, key: &str) -> Option<Primitive> {
-        v.props.iter().find(|p| p.key == key).map(|p| p.value.clone())
+        let props_guard = v.props.read().map_err(|_| StoreError::LockError).unwrap();
+        props_guard.iter().find(|p| p.key == key).map(|p| p.value.clone())
     }
 
     fn eprop(e: &multigraph::types::full_element::FullEdge, key: &str) -> Option<Primitive> {
-        e.props.iter().find(|p| p.key == key).map(|p| p.value.clone())
+        let props_guard = e.props.read().map_err(|_| StoreError::LockError).unwrap();
+        props_guard.iter().find(|p| p.key == key).map(|p| p.value.clone())
     }
 
     // ── Multi-context sequential insert + retrieve ────────────────────────────
@@ -139,7 +142,7 @@ mod tests {
         // London has two incoming edges: one from Alice, one from Bob.
         let london_in = c.get_edges(london, Direction::IN, Some(2), None).unwrap();
         assert_eq!(london_in.len(), 2);
-        let mut src_ids: Vec<u64> = london_in.iter().map(|(ek, _)| ek.primary_id).collect();
+        let mut src_ids: Vec<u64> = london_in.iter().map(|(ek, _)| ek.secondary_id).collect();
         src_ids.sort_unstable();
         assert_eq!(src_ids, vec![alice.min(bob), alice.max(bob)]);
     }
@@ -153,7 +156,7 @@ mod tests {
 
         let (v1, idx1) = c.add_vertex(1);
         let (v2, idx2) = c.add_vertex(1);
-        
+
         c.set_property(CanonicalKey::Vertex(v1), SmolStr::new("role"), Primitive::String(SmolStr::new("src"))).unwrap();
         c.set_property(CanonicalKey::Vertex(v2), SmolStr::new("role"), Primitive::String(SmolStr::new("dst"))).unwrap();
         
@@ -217,5 +220,89 @@ mod tests {
             assert_eq!(in_edges.len(), 1);
             assert_eq!(in_edges[0].1.src_id, hub);
         }
+    }
+
+    // ── concurrent contexts accumulate data ───────────────────────────────────
+
+    #[test]
+    fn two_concurrent_contexts_build_graph_fourth_reads_all() {
+        let (store, _dir) = open();
+
+        // ctx1 — person: Alice
+        let mut c1 = new_ctx(&store);
+        let alice = {
+            let (key, _) = c1.add_vertex(1);
+            c1.set_property(CanonicalKey::Vertex(key), SmolStr::new("name"), Primitive::String(SmolStr::new("Alice")))
+                .unwrap();
+            c1.set_property(CanonicalKey::Vertex(key), SmolStr::new("age"), Primitive::Int32(30)).unwrap();
+            key
+        };
+
+        // ctx2 — person: Bob
+         let mut c2 = new_ctx(&store);
+        let bob = {
+            let (key, _) = c2.add_vertex(1);
+            c2.set_property(CanonicalKey::Vertex(key), SmolStr::new("name"), Primitive::String(SmolStr::new("Bob")))
+                .unwrap();
+            c2.set_property(CanonicalKey::Vertex(key), SmolStr::new("age"), Primitive::Int32(25)).unwrap();
+            key
+        };
+
+        c2.commit().unwrap();
+        c1.commit().unwrap(); // commit after c2 to test concurrent visibility of both contexts
+    
+        
+        // ctx3 — city: London + two "lives_in" edges (label=2) from each person
+        let london = {
+            let mut c = new_ctx(&store);
+            let (city_key, _) = c.add_vertex(2);
+            c.set_property(
+                CanonicalKey::Vertex(city_key),
+                SmolStr::new("name"),
+                Primitive::String(SmolStr::new("London")),
+            )
+            .unwrap();
+            // Alice -> London
+            let e1 = cek(alice, 2, city_key);
+            c.add_edge(e1);
+            c.set_property(CanonicalKey::Edge(e1), SmolStr::new("since"), Primitive::Int32(2015)).unwrap();
+            // Bob -> London
+            let e2 = cek(bob, 2, city_key);
+            c.add_edge(e2);
+            c.set_property(CanonicalKey::Edge(e2), SmolStr::new("since"), Primitive::Int32(2019)).unwrap();
+            c.commit().unwrap();
+            city_key
+        };
+
+        // ctx4 — read-only verification
+        let mut c = new_ctx(&store);
+
+        // Vertices survive across contexts.
+        let alice_idx = c.get_vertex(alice).unwrap().unwrap();
+        assert_eq!(alice_idx.label_id, 1);
+        assert_eq!(prop(&alice_idx, "name"), Some(Primitive::String(SmolStr::new("Alice"))));
+        assert_eq!(prop(&alice_idx, "age"), Some(Primitive::Int32(30)));
+
+        let bob_idx = c.get_vertex(bob).unwrap().unwrap();
+        assert_eq!(bob_idx.label_id, 1);
+        assert_eq!(prop(&bob_idx, "name"), Some(Primitive::String(SmolStr::new("Bob"))));
+
+        let london_idx = c.get_vertex(london).unwrap().unwrap();
+        assert_eq!(london_idx.label_id, 2);
+        assert_eq!(prop(&london_idx, "name"), Some(Primitive::String(SmolStr::new("London"))));
+
+        // Both outgoing "lives_in" edges from Alice land at London.
+        let alice_out = c.get_edges(alice, Direction::OUT, Some(2), None).unwrap();
+        assert_eq!(alice_out.len(), 1);
+        let (e_idx, fe) = &alice_out[0];
+        assert_eq!(e_idx.secondary_id, london);
+        assert_eq!(eprop(&fe, "since"), Some(Primitive::Int32(2015)));
+
+        // London has two incoming edges: one from Alice, one from Bob.
+        let london_in = c.get_edges(london, Direction::IN, Some(2), None).unwrap();
+        assert_eq!(london_in.len(), 2);
+        let mut src_ids: Vec<u64> = london_in.iter().map(|(ek, _)| ek.secondary_id).collect();
+        src_ids.sort_unstable();
+        assert_eq!(src_ids, vec![alice.min(bob), alice.max(bob)]);
     }
 }

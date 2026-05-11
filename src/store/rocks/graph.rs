@@ -24,6 +24,7 @@
 //!       `4`=Float64(8B) `5`=String(len:u16 + UTF-8) `6`=Uuid(16B) `7`=Null(0B)
 
 use std::collections::HashSet;
+use std::sync::RwLock;
 
 use rocksdb::{Direction as ScanDir, IteratorMode, ReadOptions, WriteBatchWithTransaction};
 
@@ -190,7 +191,7 @@ pub(super) fn build_full_vertex(id: VertexKey, vv: &VertexValue) -> Result<FullV
     let owner = CanonicalKey::Vertex(id);
     let props = decode_props(&vv.property_blob, owner)
         .ok_or_else(|| StoreError::Other("corrupt vertex property blob".into()))?;
-    Ok(FullVertex { id, label_id: vv.label_id, props })
+    Ok(FullVertex { id, label_id: vv.label_id, props: RwLock::new(props) })
 }
 
 /// Decode an `EdgeValue` from storage into an `FullEdge`.
@@ -198,7 +199,7 @@ pub(super) fn build_full_edge(cek: CanonicalEdgeKey, ev: &EdgeValue) -> Result<F
     let owner = CanonicalKey::Edge(cek);
     let props =
         decode_props(&ev.property_blob, owner).ok_or_else(|| StoreError::Other("corrupt edge property blob".into()))?;
-    Ok(FullEdge { src_id: cek.src_id, label_id: cek.label_id, rank: cek.rank, dst_id: cek.dst_id, props })
+    Ok(FullEdge { src_id: cek.src_id, label_id: cek.label_id, rank: cek.rank, dst_id: cek.dst_id, props: RwLock::new(props) })
 }
 
 // ── Admin reads / writes ──────────────────────────────────────────────────────
@@ -294,7 +295,8 @@ impl RocksStorage {
         let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
         let mut batch = WriteBatchWithTransaction::<true>::default();
         for vv in vertices {
-            let val = VertexValue { label_id: vv.label_id, property_blob: encode_props(&vv.props) };
+            let guard_props = vv.props.read().map_err(|_| StoreError::LockError)?;
+            let val = VertexValue { label_id: vv.label_id, property_blob: encode_props(&guard_props) };
             batch.put_cf(&cf, encode_vertex_key(vv.id), val.encode());
         }
         self.db.write(batch).map_err(|e| StoreError::Other(e.to_string()))
@@ -307,7 +309,8 @@ impl RocksStorage {
         let mut batch = WriteBatchWithTransaction::<true>::default();
         for ev in edges {
             let cek = ev.canonical_key();
-            let bytes = EdgeValue { property_blob: encode_props(&ev.props) }.encode().to_vec();
+            let guard_props = ev.props.read().map_err(|_| StoreError::LockError)?;
+            let bytes = EdgeValue { property_blob: encode_props(&guard_props) }.encode().to_vec();
             batch.put_cf(&cf_out, encode_edge_key_out(cek), &bytes);
             batch.put_cf(&cf_in, encode_edge_key_in(cek), &bytes);
         }
@@ -341,11 +344,12 @@ impl RocksStorage {
 #[cfg(test)]
 mod tests {
     use smol_str::SmolStr;
+    use std::sync::RwLock;
 
     use crate::store::rocks::store::RocksStorage;
     use crate::types::full_element::{FullEdge, FullVertex};
     use crate::types::gvalue::{Primitive, Property};
-    use crate::types::{CanonicalEdgeKey, CanonicalKey, Direction};
+    use crate::types::{CanonicalEdgeKey, CanonicalKey, Direction, StoreError};
 
     fn open_temp_store() -> (RocksStorage, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -358,7 +362,7 @@ mod tests {
         FullVertex {
             id,
             label_id,
-            props: props.into_iter().map(|(k, v)| Property { owner, key: k, value: v }).collect(),
+            props: RwLock::new(props.into_iter().map(|(k, v)| Property { owner, key: k, value: v }).collect()),
         }
     }
 
@@ -369,7 +373,7 @@ mod tests {
             label_id: cek.label_id,
             rank: cek.rank,
             dst_id: cek.dst_id,
-            props: props.into_iter().map(|(k, v)| Property { owner, key: k, value: v }).collect(),
+            props: RwLock::new(props.into_iter().map(|(k, v)| Property { owner, key: k, value: v }).collect()),
         }
     }
 
@@ -392,11 +396,13 @@ mod tests {
         let fv = store.get_vertex(1).unwrap().unwrap();
         assert_eq!(fv.id, 1);
         assert_eq!(fv.label_id, 3);
-        assert_eq!(fv.props.len(), 2);
-        assert_eq!(fv.props[0].key, SmolStr::new("name"));
-        assert_eq!(fv.props[0].value, Primitive::String(SmolStr::new("Alice")));
-        assert_eq!(fv.props[0].owner, CanonicalKey::Vertex(1));
-        assert_eq!(fv.props[1].value, Primitive::Int32(30));
+        let fv_props = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(fv_props.len(), 2);
+        assert_eq!(fv_props[0].key, SmolStr::new("name"));
+        assert_eq!(fv_props[0].value, Primitive::String(SmolStr::new("Alice")));
+        assert_eq!(fv_props[0].owner, CanonicalKey::Vertex(1));
+        let props_guard = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(props_guard[1].value, Primitive::Int32(30));
     }
 
     #[test]
@@ -411,7 +417,8 @@ mod tests {
         store.insert_vertices(&[make_vertex(42, 1, vec![])]).unwrap();
         let fv = store.get_vertex(42).unwrap().unwrap();
         assert_eq!(fv.label_id, 1);
-        assert!(fv.props.is_empty());
+        let fv_props = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert!(fv_props.is_empty());
     }
 
     #[test]
@@ -421,7 +428,8 @@ mod tests {
         store.insert_vertices(&[make_vertex(1, 2, vec![(SmolStr::new("age"), Primitive::Int32(99))])]).unwrap();
         let fv = store.get_vertex(1).unwrap().unwrap();
         assert_eq!(fv.label_id, 2);
-        assert_eq!(fv.props[0].value, Primitive::Int32(99));
+        let fv_props = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(fv_props[0].value, Primitive::Int32(99));
     }
 
     #[test]
@@ -463,8 +471,9 @@ mod tests {
         assert_eq!(fe.src_id, 1);
         assert_eq!(fe.dst_id, 2);
         assert_eq!(fe.label_id, 5);
-        assert_eq!(fe.props[0].value, Primitive::Float64(1.5));
-        assert_eq!(fe.props[0].owner, CanonicalKey::Edge(k));
+        let fe_props = fe.props.read().map_err(|_| StoreError::LockError).unwrap();
+        assert_eq!(fe_props[0].value, Primitive::Float64(1.5));
+        assert_eq!(fe_props[0].owner, CanonicalKey::Edge(k));
     }
 
     #[test]
