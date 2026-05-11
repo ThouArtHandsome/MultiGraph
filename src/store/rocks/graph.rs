@@ -12,8 +12,8 @@
 
 //! Non-transactional admin read/write operations for `RocksStorage`.
 //!
-//! These methods are for bulk loads and admin tooling **only**.  They bypass
-//! OCC conflict detection; use `GraphContext` for all write paths that
+//! These methods are for bulk loads and admin tooling **only**. They bypass
+//! OCC conflict detection; use `LogicalGraph` for all write paths that
 //! require conflict safety.
 //!
 //! # Property codec

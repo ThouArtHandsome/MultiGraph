@@ -10,13 +10,12 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Query-scoped graph context — the ground truth for a single traversal.
-//!
-//! # Role
-//!
-//! `GraphContext<S>` sits between the Gremlin traversal engine and the
+//! Query-scoped logical graph — the ground truth for a single traversal.
+//! # Role:
+//! `LogicalGraph<S>` sits between the Gremlin traversal engine and the
 //! persistent `GraphStore`.  The engine never touches the store directly;
-//! it only ever calls methods on `GraphContext`.
+//! it only ever calls methods on `LogicalGraph`.
+//!
 //!
 //! ```text
 //! Traversal Engine
@@ -26,7 +25,7 @@
 //!   │  ctx.set_property(…)  → Result<(), StoreError>
 //!   │  ctx.commit()
 //!   ▼
-//! GraphContext<S: GraphStore>
+//! LogicalGraph<S: GraphStore>
 //!   vertices: HashMap<VertexKey, Arc<Vertex>>   ← query-scoped overlay
 //!   edges:    HashMap<CanonicalEdgeKey, Arc<Edge>>
 //!   dirty:    HashMap<CanonicalKey, Existence>
@@ -49,13 +48,13 @@
 //!
 //! # Commit
 //!
-//! `commit()` iterates `dirty` and calls `store.put_*` / `store.delete_*`
-//! for each element, then calls `store.commit()`.  The overlay is cleared
-//! so the `GraphContext` can be reused for a retry on OCC conflict.
+//! `commit()` iterates `dirty` and calls `store.put_*` / `store.delete_*` for
+//! each element, then calls `store.commit()`. The overlay is cleared so the
+//! `LogicalGraph` can be reused for a retry on OCC conflict.
 //!
 //! # Graph Consistency
 //!
-//! `GraphContext` is solely responsible for graph-level integrity while the
+//! `LogicalGraph` is solely responsible for graph-level integrity, while the
 //! store layer acts as a dumb physical backend. It enforces invariants such as:
 //! - Bidirectional edges: Committing an edge always emits writes for both `OUT` and `IN` indices.
 //! - Dangling prevention: Creating an edge strictly verifies the existence of both vertices.
@@ -83,9 +82,9 @@ use crate::{
     },
 };
 
-// ── Existence ─────────────────────────────────────────────────────────────────
-
-/// Mutation kind for a dirty graph element within a `GraphContext`.
+// ── Existence ────────────────────────────────────────────────────────────────
+//
+/// Mutation kind for a dirty graph element within a `LogicalGraph`.
 ///
 /// Only dirty elements appear in the `dirty` map; absence means `Clean`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,21 +97,20 @@ enum Existence {
     Tombstone,
 }
 
-// ── GraphContext ──────────────────────────────────────────────────────────────
-
-/// Query-scoped graph context wrapping a store transaction.
+// ── LogicalGraph ──────────────────────────────────────────────────────────────
+/// Query-scoped logical graph wrapping a store transaction.
 ///
-/// Obtained by calling `GraphContext::new(store.begin())`. The engine uses this
+/// Obtained by calling `LogicalGraph::new(store.begin())`. The engine uses this
 /// as its sole interface to the graph.
-pub struct GraphContext<S: GraphStore> {
+pub struct LogicalGraph<S: GraphStore> {
     store: S::Txn,
     vertices: HashMap<VertexKey, Arc<Vertex>>,
     edges: HashMap<CanonicalEdgeKey, Arc<Edge>>,
     dirty: HashMap<CanonicalKey, Existence>,
 }
 
-impl<S: GraphStore> GraphContext<S> {
-    /// Create a new context wrapping the given transaction.
+impl<S: GraphStore> LogicalGraph<S> {
+    /// Create a new logical graph context wrapping the given transaction.
     pub fn new(store: S::Txn) -> Self {
         Self { store, vertices: HashMap::new(), edges: HashMap::new(), dirty: HashMap::new() }
     }
@@ -350,8 +348,8 @@ impl<S: GraphStore> GraphContext<S> {
         match key {
             CanonicalKey::Vertex(id) => {
                 let v = self.vertices.get(&id).ok_or_else(|| StoreError::Other(format!("vertex {id} not loaded")))?;
-                if v.out_e_cnt.load(std::sync::atomic::Ordering::Relaxed) > 0 ||
-                    v.in_e_cnt.load(std::sync::atomic::Ordering::Relaxed) > 0
+                if v.out_e_cnt.load(std::sync::atomic::Ordering::Relaxed) > 0
+                    || v.in_e_cnt.load(std::sync::atomic::Ordering::Relaxed) > 0
                 {
                     return Err(StoreError::Other("cannot drop vertex with incident edges".into()));
                 }
@@ -487,7 +485,7 @@ mod tests {
 
     use smol_str::SmolStr;
 
-    use super::GraphContext;
+    use super::LogicalGraph;
     use crate::store::traits::GraphStore;
 
     use crate::{
@@ -506,8 +504,8 @@ mod tests {
         (store, dir)
     }
 
-    fn ctx(store: &RocksStorage) -> GraphContext<RocksStorage> {
-        GraphContext::new(store.begin())
+    fn ctx(store: &RocksStorage) -> LogicalGraph<RocksStorage> {
+        LogicalGraph::new(store.begin())
     }
 
     fn cek(src: u64, label: u16, dst: u64) -> CanonicalEdgeKey {
@@ -1064,16 +1062,13 @@ mod tests {
     #[test]
     fn commit_persists_edge_to_store() {
         let (store, _dir) = open();
-        let mut v1 = 0;
-        let mut v2 = 0;
-        {
+        let (v1, v2) = {
             let mut c0 = ctx(&store);
             let (v_1, _) = c0.add_vertex(1, 1).unwrap();
             let (v_2, _) = c0.add_vertex(2, 1).unwrap();
-            v1 = v_1;
-            v2 = v_2;
             c0.commit().unwrap();
-        }
+            (v_1, v_2)
+        };
         let k = cek(v1, 3, v2);
         {
             let mut c = ctx(&store);
@@ -1229,19 +1224,14 @@ mod tests {
         let (store, _dir) = open();
 
         // Commit one edge, then add another in a new context.
-        let mut v1 = 0;
-        let mut v10 = 0;
-        let mut v20 = 0;
-        {
+        let (v1, v10, v20) = {
             let mut c0 = ctx(&store);
             let (v_1, _) = c0.add_vertex(1, 1).unwrap();
             let (v_10, _) = c0.add_vertex(10, 1).unwrap();
             let (v_20, _) = c0.add_vertex(20, 1).unwrap();
-            v1 = v_1;
-            v10 = v_10;
-            v20 = v_20;
             c0.commit().unwrap();
-        }
+            (v_1, v_10, v_20)
+        };
 
         let k1 = cek(v1, 1, v10);
         {
@@ -1320,9 +1310,9 @@ mod tests {
 
         fn run_conflict<State: Copy, Setup, Op1, Op2>(setup: Setup, op1: Op1, op2: Op2)
         where
-            Setup: Fn(&mut GraphContext<RocksStorage>) -> State,
-            Op1: Fn(&mut GraphContext<RocksStorage>, State),
-            Op2: Fn(&mut GraphContext<RocksStorage>, State),
+            Setup: Fn(&mut LogicalGraph<RocksStorage>) -> State,
+            Op1: Fn(&mut LogicalGraph<RocksStorage>, State),
+            Op2: Fn(&mut LogicalGraph<RocksStorage>, State),
         {
             // Order 1: Txn1 commits, Txn2 conflicts
             {

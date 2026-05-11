@@ -10,44 +10,35 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
-use crate::types::{
-    gvalue::Property,
-    keys::{CanonicalEdgeKey, LabelId, Rank, VertexKey},
-};
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    RwLock,
-};
+use crate::types::gvalue::Property;
+use crate::types::keys::{CanonicalEdgeKey, LabelId, Rank, VertexKey};
+use std::sync::RwLock;
 
-// ── Vertex ────────────────────────────────────────────────────────────────
-
+// ── FullVertex ────────────────────────────────────────────────────────────────
+ 
 /// The ground-truth vertex record crossing the store ↔ context boundary.
 ///
 /// Returned by `GraphTransaction::get_vertex` and stored inside `LogicalGraph`'s
 /// overlay.  The traversal engine accesses properties directly via
-/// `ctx.get_vertex(key)` without copying or dereferencing an extra wrapper.
+/// `ctx.vertex(idx)` without copying or dereferencing an extra wrapper.
 /// There is no `Existence` field — the store never returns tombstoned elements.
 #[derive(Debug)]
-pub struct Vertex {
+pub struct FullVertex {
     pub id: VertexKey,
     pub label_id: LabelId,
-    /// Counter for outgoing edges, updated within the graph context.
-    pub out_e_cnt: AtomicU32,
-    /// Counter for incoming edges, updated within the graph context.
-    pub in_e_cnt: AtomicU32,
-    pub props: RwLock<Vec<Property>>, // Mutated via lock, while counters use atomic interior mutability
+    pub props: RwLock<Vec<Property>>, // Only this is mutable
 }
 
-// ── Edge ──────────────────────────────────────────────────────────────────
+// ── FullEdge ──────────────────────────────────────────────────────────────────
 
 /// The ground-truth edge record crossing the store ↔ context boundary.
 ///
 /// Always in canonical `Out` orientation.  The engine derives the directed
 /// `EdgeKey` from `canonical_key()` plus the direction it requested.
-///
+/// 
 /// TODO: haven't considered the property ordering implications of `Vec<Property>` yet.  If we need to support
 #[derive(Debug)]
-pub struct Edge {
+pub struct FullEdge {
     pub src_id: VertexKey,
     pub label_id: LabelId,
     pub rank: Rank,
@@ -55,24 +46,20 @@ pub struct Edge {
     pub props: RwLock<Vec<Property>>, // Only this is mutable
 }
 
-impl Edge {
+impl FullEdge {
     /// Extract the direction-free canonical key (same as the `edges_out` CF key).
     pub fn canonical_key(&self) -> CanonicalEdgeKey {
         CanonicalEdgeKey { src_id: self.src_id, label_id: self.label_id, rank: self.rank, dst_id: self.dst_id }
     }
 }
 
-impl PartialEq for Vertex {
+impl PartialEq for FullVertex {
     fn eq(&self, other: &Self) -> bool {
         // Compare basic fields
-        if self.id != other.id
-            || self.label_id != other.label_id
-            || self.out_e_cnt.load(Ordering::Relaxed) != other.out_e_cnt.load(Ordering::Relaxed)
-            || self.in_e_cnt.load(Ordering::Relaxed) != other.in_e_cnt.load(Ordering::Relaxed)
-        {
+        if self.id != other.id || self.label_id != other.label_id {
             return false;
         }
-
+        
         // Lock both sides to compare properties
         let p1 = self.props.read().unwrap();
         let p2 = other.props.read().unwrap();
@@ -80,19 +67,15 @@ impl PartialEq for Vertex {
     }
 }
 
-impl Eq for Vertex {}
+impl Eq for FullVertex {}
 
-impl PartialEq for Edge {
+impl PartialEq for FullEdge {
     fn eq(&self, other: &Self) -> bool {
         // Compare basic fields
-        if self.src_id != other.src_id
-            || self.label_id != other.label_id
-            || self.rank != other.rank
-            || self.dst_id != other.dst_id
-        {
+        if self.src_id != other.src_id || self.label_id != other.label_id || self.rank != other.rank || self.dst_id != other.dst_id {
             return false;
         }
-
+        
         // Lock both sides to compare properties
         let p1 = self.props.read().unwrap();
         let p2 = other.props.read().unwrap();
@@ -100,4 +83,4 @@ impl PartialEq for Edge {
     }
 }
 
-impl Eq for Edge {}
+impl Eq for FullEdge {}

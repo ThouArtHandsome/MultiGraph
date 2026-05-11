@@ -16,9 +16,9 @@
 //!
 //! ```text
 //! Gremlin Traversal Engine
-//!   │  talks only to GraphContext via inherent methods
+//!   │  talks only to `LogicalGraph` via inherent methods
 //!   ▼
-//! GraphContext<S: GraphStore>       ← query-scoped ground truth
+//! LogicalGraph<S: GraphStore>       ← query-scoped ground truth
 //!   │  owns the element overlay (VertexIdx / EdgeIdx)
 //!   │  merges committed + dirty state
 //!   │  forwards to S::Txn on commit
@@ -35,7 +35,7 @@
 //! The engine never imports `GraphTransaction` or `GraphStore` directly —
 //! it only touches `GraphContext`.  Backend details (RocksDB CFs, OCC,
 //! encoding) never cross the `GraphTransaction` boundary.
-
+//! it only touches `LogicalGraph`. Backend details (RocksDB CFs, OCC, encoding) never cross the `GraphTransaction` boundary.
 use std::sync::Arc;
 
 use crate::types::{gvalue::Property, CanonicalEdgeKey, Direction, Edge, LabelId, StoreError, Vertex, VertexKey};
@@ -43,9 +43,8 @@ use crate::types::{gvalue::Property, CanonicalEdgeKey, Direction, Edge, LabelId,
 // ── GraphTransaction ──────────────────────────────────────────────────────────
 
 /// A single I/O transaction against the persistent graph store.
-///
-/// `GraphContext` is the only caller.  The engine never holds a
-/// `GraphTransaction` directly — it always works through `GraphContext`.
+/// `LogicalGraph` is the only caller. The engine never holds a `GraphTransaction`
+/// directly — it always works through `LogicalGraph`.
 ///
 /// # Read semantics
 ///
@@ -126,7 +125,7 @@ pub trait GraphTransaction {
 /// A pluggable graph store backend.
 ///
 /// Implementations include `RocksStorage` (local) and future distributed
-/// backends.  The engine (and `GraphContext`) is generic over `S: GraphStore`
+/// backends. The engine (and `LogicalGraph`) is generic over `S: GraphStore`
 /// and never imports concrete backend types.
 pub trait GraphStore {
     /// The concrete transaction type produced by this store.

@@ -11,7 +11,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 pub mod compiler;
-pub mod context;
+pub mod graph;
 pub mod schema;
 pub mod server;
 pub mod store;

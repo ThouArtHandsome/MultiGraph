@@ -17,7 +17,7 @@
 //! `Transaction` is a pure I/O layer: it encodes and decodes graph elements
 //! to/from RocksDB bytes and stages reads/writes on an `OptimisticTransactionDB`
 //! handle.  All overlay logic (dirty tracking, query-scoped caching, key
-//! allocation) lives in `GraphContext`, one layer above.
+//! allocation) lives in `LogicalGraph`, one layer above.
 //!
 //! # Read path
 //!
@@ -30,8 +30,8 @@
 //!
 //! This layer is physically pure: `put_edge` and `delete_edge` write or
 //! delete exactly one record (either `CF_EDGES_OUT` or `CF_EDGES_IN`). Graph
-//! consistency logic (like ensuring forward and backward edges exist) is
-//! entirely deferred to `GraphContext`. All staged operations are flushed atomically by `commit`.
+//! consistency logic (like ensuring forward and backward edges exist) is entirely
+//! deferred to `LogicalGraph`. All staged operations are flushed atomically by `commit`.
 //!
 //! # Lifetime erasure
 //!
