@@ -47,7 +47,10 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use rocksdb::{Direction as ScanDir, IteratorMode, OptimisticTransactionDB, ReadOptions};
+use rocksdb::{
+    Direction as ScanDir, IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, ReadOptions,
+    WriteOptions,
+};
 
 use crate::{
     store::{
@@ -77,7 +80,9 @@ type OwnedRocksTxn = rocksdb::Transaction<'static, OptimisticTransactionDB>;
 /// `Arc<OptimisticTransactionDB>` it was created from.  In `Transaction` this
 /// is guaranteed by field declaration order (`db_txn` before `db`).
 fn begin_txn(db: &Arc<OptimisticTransactionDB>) -> OwnedRocksTxn {
-    let txn: rocksdb::Transaction<'_, OptimisticTransactionDB> = db.transaction();
+    let mut opts = OptimisticTransactionOptions::default();
+    opts.set_snapshot(true); // This is the equivalent of txn->SetSnapshot()
+    let txn: rocksdb::Transaction<'_, OptimisticTransactionDB> = db.transaction_opt(&WriteOptions::default(), &opts);
     // SAFETY: see module doc and function safety note.
     unsafe { std::mem::transmute(txn) }
 }
