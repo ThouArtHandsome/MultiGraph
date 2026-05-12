@@ -23,10 +23,7 @@
 //! Tags: `0`=Bool(1B) `1`=Int32(4B) `2`=Int64(8B) `3`=Float32(4B)
 //!       `4`=Float64(8B) `5`=String(len:u16 + UTF-8) `6`=Uuid(16B) `7`=Null(0B)
 
-use std::{
-    collections::HashSet,
-    sync::{atomic::AtomicU32, RwLock},
-};
+use std::{collections::HashSet, sync::RwLock};
 
 use rocksdb::{Direction as ScanDir, IteratorMode, ReadOptions, WriteBatchWithTransaction};
 
@@ -34,7 +31,8 @@ use crate::{
     store::rocks::{
         encoding::{
             decode_edge_key_in, decode_edge_key_out, edge_scan_prefix, encode_edge_key_in, encode_edge_key_out,
-            encode_vertex_key, prefix_upper_bound, EdgeValue, VertexValue, CF_EDGES_IN, CF_EDGES_OUT, CF_VERTICES,
+            encode_vertex_key, prefix_upper_bound, EdgeValue, VertexCounts, VertexValue, CF_EDGES_IN, CF_EDGES_OUT,
+            CF_VERTEX_COUNTS, CF_VERTICES,
         },
         store::RocksStorage,
     },
@@ -194,18 +192,12 @@ pub(super) fn decode_props(blob: &[u8], owner: CanonicalKey) -> Option<Vec<Prope
 
 // ── Element builders ──────────────────────────────────────────────────────────
 
-/// Decode a `VertexValue` from storage into a `Vertex`.
+/// Decode a `VertexValue` and `VertexCounts` from storage into a `Vertex`.
 pub(super) fn build_full_vertex(id: VertexKey, vv: &VertexValue) -> Result<Vertex, StoreError> {
     let owner = CanonicalKey::Vertex(id);
     let props = decode_props(&vv.property_blob, owner)
         .ok_or_else(|| StoreError::Other("corrupt vertex property blob".into()))?;
-    Ok(Vertex {
-        id,
-        label_id: vv.label_id,
-        out_e_cnt: AtomicU32::new(vv.out_e_cnt),
-        in_e_cnt: AtomicU32::new(vv.in_e_cnt),
-        props: RwLock::new(props),
-    })
+    Ok(Vertex { id, label_id: vv.label_id, props: RwLock::new(props) })
 }
 
 /// Decode an `EdgeValue` from storage into an `Edge`.
@@ -229,27 +221,31 @@ pub(super) fn build_full_edge(cek: CanonicalEdgeKey, ev: &EdgeValue) -> Result<E
 #[allow(dead_code)]
 impl RocksStorage {
     pub(crate) fn get_vertex(&self, key: VertexKey) -> Result<Option<Vertex>, StoreError> {
-        let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
-        match self.db.get_cf(&cf, encode_vertex_key(key)).map_err(|e| StoreError::Other(e.to_string()))? {
-            None => Ok(None),
-            Some(raw) => {
-                let vv = VertexValue::decode(&raw).ok_or_else(|| StoreError::Other("corrupt vertex value".into()))?;
+        let cf_vertices =
+            self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
+        let vv_raw =
+            self.db.get_cf(&cf_vertices, encode_vertex_key(key)).map_err(|e| StoreError::Other(e.to_string()))?;
+        match vv_raw {
+            Some(vv_bytes) => {
+                let vv =
+                    VertexValue::decode(&vv_bytes).ok_or_else(|| StoreError::Other("corrupt vertex value".into()))?;
                 Ok(Some(build_full_vertex(key, &vv)?))
             }
+            _ => Ok(None),
         }
     }
 
     pub(crate) fn get_vertices(&self, keys: &[VertexKey]) -> Result<Vec<Vertex>, StoreError> {
-        let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
+        let cf_vertices =
+            self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
         let mut result = Vec::with_capacity(keys.len());
         for &key in keys {
-            match self.db.get_cf(&cf, encode_vertex_key(key)).map_err(|e| StoreError::Other(e.to_string()))? {
-                None => {}
-                Some(raw) => {
-                    let vv =
-                        VertexValue::decode(&raw).ok_or_else(|| StoreError::Other("corrupt vertex value".into()))?;
-                    result.push(build_full_vertex(key, &vv)?);
-                }
+            let vv_raw =
+                self.db.get_cf(&cf_vertices, encode_vertex_key(key)).map_err(|e| StoreError::Other(e.to_string()))?;
+            if let Some(vv_bytes) = vv_raw {
+                let vv =
+                    VertexValue::decode(&vv_bytes).ok_or_else(|| StoreError::Other("corrupt vertex value".into()))?;
+                result.push(build_full_vertex(key, &vv)?);
             }
         }
         Ok(result)
@@ -316,17 +312,17 @@ impl RocksStorage {
     // `WriteBatch` (TRANSACTION=false) is a compile-time type mismatch.
 
     pub(crate) fn insert_vertices(&mut self, vertices: &[Vertex]) -> Result<(), StoreError> {
-        let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
+        let cf_vertices =
+            self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
+        let cf_counts =
+            self.db.cf_handle(CF_VERTEX_COUNTS).ok_or_else(|| StoreError::Other("missing CF: vertex_counts".into()))?;
         let mut batch = WriteBatchWithTransaction::<true>::default();
         for vv in vertices {
             let guard_props = vv.props.read().map_err(|_| StoreError::LockError)?;
-            let val = VertexValue {
-                label_id: vv.label_id,
-                out_e_cnt: vv.out_e_cnt.load(std::sync::atomic::Ordering::Relaxed),
-                in_e_cnt: vv.in_e_cnt.load(std::sync::atomic::Ordering::Relaxed),
-                property_blob: encode_props(&guard_props),
-            };
-            batch.put_cf(&cf, encode_vertex_key(vv.id), val.encode());
+            let val = VertexValue { label_id: vv.label_id, property_blob: encode_props(&guard_props) };
+            let counts = VertexCounts { out_e_cnt: 0, in_e_cnt: 0 };
+            batch.put_cf(&cf_vertices, encode_vertex_key(vv.id), val.encode());
+            batch.put_cf(&cf_counts, encode_vertex_key(vv.id), counts.encode());
         }
         self.db.write(batch).map_err(|e| StoreError::Other(e.to_string()))
     }
@@ -383,7 +379,7 @@ impl RocksStorage {
 #[cfg(test)]
 mod tests {
     use smol_str::SmolStr;
-    use std::sync::{atomic::AtomicU32, RwLock};
+    use std::sync::RwLock;
 
     use crate::{
         store::rocks::store::RocksStorage,
@@ -400,13 +396,11 @@ mod tests {
         (store, dir)
     }
 
-    fn make_vertex(id: u64, label_id: u16, out_e_cnt: u32, in_e_cnt: u32, props: Vec<(SmolStr, Primitive)>) -> Vertex {
+    fn make_vertex(id: u64, label_id: u16, props: Vec<(SmolStr, Primitive)>) -> Vertex {
         let owner = CanonicalKey::Vertex(id);
         Vertex {
             id,
             label_id,
-            out_e_cnt: AtomicU32::new(out_e_cnt),
-            in_e_cnt: AtomicU32::new(in_e_cnt),
             props: RwLock::new(props.into_iter().map(|(k, v)| Property { owner, key: k, value: v }).collect()),
         }
     }
@@ -432,8 +426,6 @@ mod tests {
         let v = make_vertex(
             1,
             3,
-            0,
-            0,
             vec![
                 (SmolStr::new("name"), Primitive::String(SmolStr::new("Alice"))),
                 (SmolStr::new("age"), Primitive::Int32(30)),
@@ -461,7 +453,7 @@ mod tests {
     #[test]
     fn insert_vertex_with_no_props() {
         let (mut store, _dir) = open_temp_store();
-        store.insert_vertices(&[make_vertex(42, 1, 0, 0, vec![])]).unwrap();
+        store.insert_vertices(&[make_vertex(42, 1, vec![])]).unwrap();
         let fv = store.get_vertex(42).unwrap().unwrap();
         assert_eq!(fv.label_id, 1);
         let fv_props = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
@@ -471,26 +463,19 @@ mod tests {
     #[test]
     fn insert_vertex_overwrite_updates_value() {
         let (mut store, _dir) = open_temp_store();
-        store.insert_vertices(&[make_vertex(1, 1, 0, 0, vec![(SmolStr::new("age"), Primitive::Int32(20))])]).unwrap();
-        store.insert_vertices(&[make_vertex(1, 2, 5, 2, vec![(SmolStr::new("age"), Primitive::Int32(99))])]).unwrap();
+        store.insert_vertices(&[make_vertex(1, 1, vec![(SmolStr::new("age"), Primitive::Int32(20))])]).unwrap();
+        store.insert_vertices(&[make_vertex(1, 2, vec![(SmolStr::new("age"), Primitive::Int32(99))])]).unwrap();
         let fv = store.get_vertex(1).unwrap().unwrap();
         assert_eq!(fv.label_id, 2);
         let fv_props = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
         assert_eq!(fv_props[0].value, Primitive::Int32(99));
-
-        assert_eq!(fv.out_e_cnt.load(std::sync::atomic::Ordering::Relaxed), 5);
-        assert_eq!(fv.in_e_cnt.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]
     fn get_vertices_returns_all_inserted() {
         let (mut store, _dir) = open_temp_store();
         store
-            .insert_vertices(&[
-                make_vertex(1, 1, 0, 0, vec![]),
-                make_vertex(2, 1, 0, 0, vec![]),
-                make_vertex(3, 2, 0, 0, vec![]),
-            ])
+            .insert_vertices(&[make_vertex(1, 1, vec![]), make_vertex(2, 1, vec![]), make_vertex(3, 2, vec![])])
             .unwrap();
         let results = store.get_vertices(&[1, 2, 3]).unwrap();
         assert_eq!(results.len(), 3);
@@ -502,7 +487,7 @@ mod tests {
     #[test]
     fn get_vertices_silently_omits_missing_keys() {
         let (mut store, _dir) = open_temp_store();
-        store.insert_vertices(&[make_vertex(10, 1, 0, 0, vec![])]).unwrap();
+        store.insert_vertices(&[make_vertex(10, 1, vec![])]).unwrap();
         let results = store.get_vertices(&[10, 20, 30]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 10);

@@ -54,7 +54,8 @@ use crate::{
         rocks::{
             encoding::{
                 decode_edge_key_in, decode_edge_key_out, edge_scan_prefix, encode_edge_key_in, encode_edge_key_out,
-                encode_vertex_key, prefix_upper_bound, EdgeValue, VertexValue, CF_EDGES_IN, CF_EDGES_OUT, CF_VERTICES,
+                encode_vertex_key, prefix_upper_bound, EdgeValue, VertexCounts, VertexValue, CF_EDGES_IN, CF_EDGES_OUT,
+                CF_VERTEX_COUNTS, CF_VERTICES,
             },
             graph::{build_full_edge, build_full_vertex, encode_props},
         },
@@ -110,20 +111,41 @@ impl Transaction {
 
 impl GraphTransaction for Transaction {
     fn get_vertex(&mut self, key: VertexKey) -> Result<Option<Arc<Vertex>>, StoreError> {
-        let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
-        let raw_opt = self
+        let cf_vertices =
+            self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
+        let vv_raw = self
             .db_txn
             .as_ref()
             .expect("no active transaction")
-            .get_for_update_cf(&cf, encode_vertex_key(key), true)
+            .get_for_update_cf(&cf_vertices, encode_vertex_key(key), true)
             .map_err(|e| StoreError::Other(e.to_string()))?;
 
-        match raw_opt {
-            None => Ok(None),
-            Some(raw) => {
-                let vv = VertexValue::decode(&raw).ok_or_else(|| StoreError::Other("corrupt vertex value".into()))?;
+        match vv_raw {
+            Some(vv_bytes) => {
+                let vv =
+                    VertexValue::decode(&vv_bytes).ok_or_else(|| StoreError::Other("corrupt vertex value".into()))?;
                 Ok(Some(Arc::new(build_full_vertex(key, &vv)?)))
             }
+            _ => Ok(None),
+        }
+    }
+
+    fn get_vertex_counts(&mut self, key: VertexKey) -> Result<Option<(u32, u32)>, StoreError> {
+        let cf_counts =
+            self.db.cf_handle(CF_VERTEX_COUNTS).ok_or_else(|| StoreError::Other("missing CF: vertex_counts".into()))?;
+        let vc_raw = self
+            .db_txn
+            .as_ref()
+            .expect("no active transaction")
+            .get_for_update_cf(&cf_counts, encode_vertex_key(key), true)
+            .map_err(|e| StoreError::Other(e.to_string()))?;
+        match vc_raw {
+            Some(vc_bytes) => {
+                let vc =
+                    VertexCounts::decode(&vc_bytes).ok_or_else(|| StoreError::Other("corrupt vertex counts".into()))?;
+                Ok(Some((vc.out_e_cnt, vc.in_e_cnt)))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -192,41 +214,45 @@ impl GraphTransaction for Transaction {
         Ok(result)
     }
 
-    fn put_vertex(
-        &mut self,
-        key: VertexKey,
-        label_id: LabelId,
-        out_e_cnt: u32,
-        in_e_cnt: u32,
-        props: &[Property],
-    ) -> Result<(), StoreError> {
-        let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
-        let vv = VertexValue { label_id, out_e_cnt, in_e_cnt, property_blob: encode_props(props) };
-        self.db_txn
-            .as_ref()
-            .expect("no active transaction")
-            .put_cf(&cf, encode_vertex_key(key), vv.encode())
-            .map_err(|e| StoreError::Other(e.to_string()))
+    fn put_vertex(&mut self, key: VertexKey, label_id: LabelId, props: &[Property]) -> Result<(), StoreError> {
+        let txn = self.db_txn.as_ref().expect("no active transaction");
+        let cf_vertices =
+            self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
+        let vv = VertexValue { label_id, property_blob: encode_props(props) };
+        txn.put_cf(&cf_vertices, encode_vertex_key(key), vv.encode()).map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    fn put_vertex_counts(&mut self, key: VertexKey, out_e_cnt: u32, in_e_cnt: u32) -> Result<(), StoreError> {
+        let txn = self.db_txn.as_ref().expect("no active transaction");
+        let cf_counts =
+            self.db.cf_handle(CF_VERTEX_COUNTS).ok_or_else(|| StoreError::Other("missing CF: vertex_counts".into()))?;
+        let vc = VertexCounts { out_e_cnt, in_e_cnt };
+        txn.put_cf(&cf_counts, encode_vertex_key(key), vc.encode()).map_err(|e| StoreError::Other(e.to_string()))
     }
 
     fn put_edge(&mut self, key: CanonicalEdgeKey, direction: Direction, props: &[Property]) -> Result<(), StoreError> {
+        let txn = self.db_txn.as_ref().expect("no active transaction");
         let (cf_name, key_bytes) = match direction {
             Direction::OUT => (CF_EDGES_OUT, encode_edge_key_out(key)),
             Direction::IN => (CF_EDGES_IN, encode_edge_key_in(key)),
         };
         let cf = self.db.cf_handle(cf_name).ok_or_else(|| StoreError::Other(format!("missing CF: {cf_name}")))?;
         let ev_bytes = EdgeValue { property_blob: encode_props(props) }.encode().to_vec();
-        let txn = self.db_txn.as_ref().expect("no active transaction");
         txn.put_cf(&cf, key_bytes, &ev_bytes).map_err(|e| StoreError::Other(e.to_string()))
     }
 
     fn delete_vertex(&mut self, key: VertexKey) -> Result<(), StoreError> {
-        let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
-        self.db_txn
-            .as_ref()
-            .expect("no active transaction")
-            .delete_cf(&cf, encode_vertex_key(key))
-            .map_err(|e| StoreError::Other(e.to_string()))
+        let cf_vertices =
+            self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
+        let txn = self.db_txn.as_ref().expect("no active transaction");
+        txn.delete_cf(&cf_vertices, encode_vertex_key(key)).map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    fn delete_vertex_counts(&mut self, key: VertexKey) -> Result<(), StoreError> {
+        let cf_counts =
+            self.db.cf_handle(CF_VERTEX_COUNTS).ok_or_else(|| StoreError::Other("missing CF: vertex_counts".into()))?;
+        let txn = self.db_txn.as_ref().expect("no active transaction");
+        txn.delete_cf(&cf_counts, encode_vertex_key(key)).map_err(|e| StoreError::Other(e.to_string()))
     }
 
     fn delete_edge(&mut self, key: CanonicalEdgeKey, direction: Direction) -> Result<(), StoreError> {

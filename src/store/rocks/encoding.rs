@@ -17,11 +17,12 @@
 //!
 //! # Column families
 //!
-//! | CF name      | Key layout                               | Value layout              |
-//! |--------------|------------------------------------------|---------------------------|
-//! | `vertices`   | `[ VertexId:u64 ]`                       | `[ label_id:u16 \| props ]`|
-//! | `edges_out`  | `[ SrcId:u64 \| LabelId:u16 \| Rank:u16 \| DstId:u64 ]` | `[ props ]` |
-//! | `edges_in`   | `[ DstId:u64 \| LabelId:u16 \| Rank:u16 \| SrcId:u64 ]` | `[ props ]` |
+//! | CF name         | Key layout                               | Value layout                        |
+//! |-----------------|------------------------------------------|-------------------------------------|
+//! | `vertices`      | `[ VertexId:u64 ]`                       | `[ label_id:u16 \| props ]`         |
+//! | `vertex_counts` | `[ VertexId:u64 ]`                       | `[ out_e_cnt:u32 \| in_e_cnt:u32 ]` |
+//! | `edges_out`     | `[ SrcId:u64 \| LabelId:u16 \| Rank:u16 \| DstId:u64 ]` | `[ props ]` |
+//! | `edges_in`      | `[ DstId:u64 \| LabelId:u16 \| Rank:u16 \| SrcId:u64 ]` | `[ props ]` |
 //!
 //! Edge properties are duplicated across `edges_out` and `edges_in`.
 //! The direction byte present in previous versions has been removed; each CF
@@ -67,6 +68,7 @@ pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 // ── Column-family name constants ──────────────────────────────────────────────
 
 pub const CF_VERTICES: &str = "vertices";
+pub const CF_VERTEX_COUNTS: &str = "vertex_counts";
 pub const CF_EDGES_OUT: &str = "edges_out";
 pub const CF_EDGES_IN: &str = "edges_in";
 
@@ -143,37 +145,58 @@ pub fn decode_edge_key_in(bytes: &[u8]) -> Option<CanonicalEdgeKey> {
 
 // ── VertexValue ───────────────────────────────────────────────────────────────
 
-/// `[ label_id:u16 | out_e_cnt:u32 | in_e_cnt:u32 | property_blob ]` — value in the `vertices` CF.
+/// `[ label_id:u16 | property_blob ]` — value in the `vertices` CF.
 ///
 /// The label string is NOT stored here; `label_id` is resolved to a string
 /// via the process-wide `Schema` when needed.
 #[derive(Debug, Clone)]
 pub struct VertexValue {
     pub label_id: LabelId,
-    pub out_e_cnt: u32,
-    pub in_e_cnt: u32,
     pub property_blob: Vec<u8>,
 }
 
 impl VertexValue {
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(10 + self.property_blob.len());
+        let mut buf = Vec::with_capacity(2 + self.property_blob.len());
         buf.extend_from_slice(&self.label_id.to_be_bytes());
-        buf.extend_from_slice(&self.out_e_cnt.to_be_bytes());
-        buf.extend_from_slice(&self.in_e_cnt.to_be_bytes());
         buf.extend_from_slice(&self.property_blob);
         buf
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 10 {
+        if bytes.len() < 2 {
             return None;
         }
         let label_id = u16::from_be_bytes(bytes[0..2].try_into().ok()?);
-        let out_e_cnt = u32::from_be_bytes(bytes[2..6].try_into().ok()?);
-        let in_e_cnt = u32::from_be_bytes(bytes[6..10].try_into().ok()?);
-        let property_blob = bytes[10..].to_vec();
-        Some(Self { label_id, out_e_cnt, in_e_cnt, property_blob })
+        let property_blob = bytes[2..].to_vec();
+        Some(Self { label_id, property_blob })
+    }
+}
+
+// ── VertexCounts ──────────────────────────────────────────────────────────────
+
+/// `[ out_e_cnt:u32 | in_e_cnt:u32 ]` — value in the `vertex_counts` CF.
+#[derive(Debug, Clone)]
+pub struct VertexCounts {
+    pub out_e_cnt: u32,
+    pub in_e_cnt: u32,
+}
+
+impl VertexCounts {
+    pub fn encode(&self) -> [u8; 8] {
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&self.out_e_cnt.to_be_bytes());
+        buf[4..8].copy_from_slice(&self.in_e_cnt.to_be_bytes());
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 8 {
+            return None;
+        }
+        let out_e_cnt = u32::from_be_bytes(bytes[0..4].try_into().ok()?);
+        let in_e_cnt = u32::from_be_bytes(bytes[4..8].try_into().ok()?);
+        Some(Self { out_e_cnt, in_e_cnt })
     }
 }
 
@@ -200,11 +223,11 @@ impl EdgeValue {
 #[cfg(test)]
 mod tests {
     use smol_str::SmolStr;
-    use std::sync::{atomic::AtomicU32, RwLock};
+    use std::sync::RwLock;
 
     use super::{
         decode_edge_key_in, decode_edge_key_out, decode_vertex_key, encode_edge_key_in, encode_edge_key_out,
-        encode_vertex_key, EdgeValue, VertexValue,
+        encode_vertex_key, EdgeValue, VertexCounts, VertexValue,
     };
     use crate::types::{
         element::{Edge, Vertex},
@@ -317,16 +340,10 @@ mod tests {
         out
     }
 
-    fn make_vertex(id: u64, label_id: u16, out_e_cnt: u32, in_e_cnt: u32, raw: &[(PropKey, Primitive)]) -> Vertex {
+    fn make_vertex(id: u64, label_id: u16, raw: &[(PropKey, Primitive)]) -> Vertex {
         let owner = CanonicalKey::Vertex(id);
         let props = raw.iter().map(|(k, v)| Property { owner, key: k.clone(), value: v.clone() }).collect();
-        Vertex {
-            id,
-            label_id,
-            out_e_cnt: AtomicU32::new(out_e_cnt),
-            in_e_cnt: AtomicU32::new(in_e_cnt),
-            props: RwLock::new(props),
-        }
+        Vertex { id, label_id, props: RwLock::new(props) }
     }
 
     fn make_edge(cek: CanonicalEdgeKey, raw: &[(PropKey, Primitive)]) -> Edge {
@@ -391,12 +408,10 @@ mod tests {
             (SmolStr::new("name"), Primitive::String(SmolStr::new("Alice"))),
             (SmolStr::new("age"), Primitive::Int32(30)),
         ];
-        let vv = VertexValue { label_id: 7, out_e_cnt: 10, in_e_cnt: 20, property_blob: encode_props(&raw) };
+        let vv = VertexValue { label_id: 7, property_blob: encode_props(&raw) };
         let bytes = vv.encode();
         let dec = VertexValue::decode(&bytes).unwrap();
         assert_eq!(dec.label_id, 7);
-        assert_eq!(dec.out_e_cnt, 10);
-        assert_eq!(dec.in_e_cnt, 20);
         let props = decode_props(&dec.property_blob);
         assert_eq!(props.len(), 2);
         assert_eq!(props[0].0, SmolStr::new("name"));
@@ -406,8 +421,26 @@ mod tests {
 
     #[test]
     fn vertex_value_decode_bad_length() {
-        assert!(VertexValue::decode(&[0u8; 9]).is_none());
+        assert!(VertexValue::decode(&[0u8; 1]).is_none());
         assert!(VertexValue::decode(&[]).is_none());
+    }
+
+    // ── VertexCounts ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn vertex_counts_encode_decode() {
+        let vc = VertexCounts { out_e_cnt: 10, in_e_cnt: 20 };
+        let bytes = vc.encode();
+        assert_eq!(bytes.len(), 8);
+        let dec = VertexCounts::decode(&bytes).unwrap();
+        assert_eq!(dec.out_e_cnt, 10);
+        assert_eq!(dec.in_e_cnt, 20);
+    }
+
+    #[test]
+    fn vertex_counts_decode_bad_length() {
+        assert!(VertexCounts::decode(&[0u8; 7]).is_none());
+        assert!(VertexCounts::decode(&[0u8; 9]).is_none());
     }
 
     // ── Full roundtrips ───────────────────────────────────────────────────────
@@ -419,14 +452,13 @@ mod tests {
             (SmolStr::new("score"), Primitive::Float64(9.9)),
         ];
         let key_bytes = encode_vertex_key(42);
-        let val_bytes =
-            VertexValue { label_id: 1, out_e_cnt: 5, in_e_cnt: 8, property_blob: encode_props(&raw) }.encode();
+        let val_bytes = VertexValue { label_id: 1, property_blob: encode_props(&raw) }.encode();
         let id = decode_vertex_key(&key_bytes).unwrap();
         let vv = VertexValue::decode(&val_bytes).unwrap();
         assert_eq!(id, 42);
         assert_eq!(vv.label_id, 1);
         let dec_props = decode_props(&vv.property_blob);
-        let fv = make_vertex(id, vv.label_id, vv.out_e_cnt, vv.in_e_cnt, &dec_props);
+        let fv = make_vertex(id, vv.label_id, &dec_props);
         assert_eq!(fv.id, 42);
         assert_eq!(fv.label_id, 1);
         let props_guard = fv.props.read().map_err(|_| StoreError::LockError).unwrap();
@@ -485,7 +517,7 @@ mod tests {
         let props_guard = fe.props.write().map_err(|_| StoreError::LockError).unwrap();
         assert_eq!(props_guard[0].owner, CanonicalKey::Edge(cek));
 
-        let fv = make_vertex(99, 2, 0, 0, &[(SmolStr::new("x"), Primitive::Int32(7))]);
+        let fv = make_vertex(99, 2, &[(SmolStr::new("x"), Primitive::Int32(7))]);
         let props_guard = fv.props.write().map_err(|_| StoreError::LockError).unwrap();
         assert_eq!(props_guard[0].owner, CanonicalKey::Vertex(99));
     }

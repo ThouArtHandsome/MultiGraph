@@ -17,7 +17,7 @@ use rocksdb::{ColumnFamilyDescriptor, OptimisticTransactionDB, Options};
 use crate::{
     store::{
         rocks::{
-            encoding::{CF_EDGES_IN, CF_EDGES_OUT, CF_VERTICES},
+            encoding::{CF_EDGES_IN, CF_EDGES_OUT, CF_VERTEX_COUNTS, CF_VERTICES},
             transaction::Transaction,
         },
         traits::GraphStore,
@@ -43,7 +43,7 @@ impl RocksStorage {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
-        let cfs = [CF_VERTICES, CF_EDGES_OUT, CF_EDGES_IN]
+        let cfs = [CF_VERTICES, CF_VERTEX_COUNTS, CF_EDGES_OUT, CF_EDGES_IN]
             .into_iter()
             .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
             .collect::<Vec<_>>();

@@ -67,8 +67,8 @@
 //! modify them in place.
 
 use std::{
-    collections::HashMap,
-    sync::{atomic::AtomicU32, Arc, RwLock},
+    collections::{hash_map::Entry, HashMap},
+    sync::{Arc, RwLock},
 };
 
 use crate::{
@@ -87,14 +87,36 @@ use crate::{
 /// Mutation kind for a dirty graph element within a `LogicalGraph`.
 ///
 /// Only dirty elements appear in the `dirty` map; absence means `Clean`.
+/// TODO:
+///     1. how to handle delete -> add on the same element within a single query?
+///     This is currently treated as `New`, but we might want to distinguish it
+///     from a pure create for better conflict detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Existence {
-    /// Props were mutated (element pre-existed in storage).
+    /// Props were mutated on an existing element.
     Modified,
+    /// Only the vertex edge counts changed.
+    CounterOnly,
+    /// Props and vertex edge counts both changed.
+    ModifiedWithCounter,
     /// Created in this query; not yet persisted.
     New,
     /// Deleted in this query.
     Tombstone,
+}
+
+impl Existence {
+    fn merge(self, other: Existence) -> Existence {
+        use Existence::*;
+        match (self, other) {
+            (Tombstone, _) | (_, Tombstone) => Tombstone,
+            (New, _) | (_, New) => New,
+            (ModifiedWithCounter, _) | (_, ModifiedWithCounter) => ModifiedWithCounter,
+            (Modified, CounterOnly) | (CounterOnly, Modified) => ModifiedWithCounter,
+            (Modified, Modified) => Modified,
+            (CounterOnly, CounterOnly) => CounterOnly,
+        }
+    }
 }
 
 // ── LogicalGraph ──────────────────────────────────────────────────────────────
@@ -106,13 +128,47 @@ pub struct LogicalGraph<S: GraphStore> {
     store: S::Txn,
     vertices: HashMap<VertexKey, Arc<Vertex>>,
     edges: HashMap<CanonicalEdgeKey, Arc<Edge>>,
+    vertex_counts: HashMap<VertexKey, (u32, u32)>,
     dirty: HashMap<CanonicalKey, Existence>,
 }
 
 impl<S: GraphStore> LogicalGraph<S> {
     /// Create a new logical graph context wrapping the given transaction.
     pub fn new(store: S::Txn) -> Self {
-        Self { store, vertices: HashMap::new(), edges: HashMap::new(), dirty: HashMap::new() }
+        Self {
+            store,
+            vertices: HashMap::new(),
+            edges: HashMap::new(),
+            vertex_counts: HashMap::new(),
+            dirty: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_vertex_counts_for_test(&mut self, key: VertexKey) -> Result<Option<(u32, u32)>, StoreError> {
+        self.get_vertex_counts(key)
+    }
+
+    fn get_vertex_counts(&mut self, key: VertexKey) -> Result<Option<(u32, u32)>, StoreError> {
+        if let Some(counts) = self.vertex_counts.get(&key) {
+            return Ok(Some(*counts));
+        }
+        self.store.get_vertex_counts(key)?.map_or(Ok(None), |counts| {
+            self.vertex_counts.insert(key, counts);
+            Ok(Some(counts))
+        })
+    }
+
+    fn mark_dirty(&mut self, key: CanonicalKey, state: Existence) {
+        match self.dirty.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(state);
+            }
+            Entry::Occupied(mut entry) => {
+                let combined = entry.get().merge(state);
+                *entry.get_mut() = combined;
+            }
+        }
     }
 
     // ── Reads ─────────────────────────────────────────────────────────────────
@@ -120,10 +176,11 @@ impl<S: GraphStore> LogicalGraph<S> {
     /// Look up a vertex by key, loading from the store on first access.
     ///
     /// Returns `None` for absent or tombstoned vertices.
-    // TODO: Consider adding a batch `get_vertices` method for bulk property retrieval.
-    // Currently, `get_vertex` serves dual purposes: fetching property data and checking
-    // for existence. A batch API would improve data fetching performance, but requires careful
-    // design to comfortably handle partial results where some keys might be missing.
+    // TODO:
+    //      1. Consider adding a batch `get_vertices` method for bulk property retrieval.
+    //      Currently, `get_vertex` serves dual purposes: fetching property data and checking
+    //      for existence. A batch API would improve data fetching performance, but requires careful
+    //      design to comfortably handle partial results where some keys might be missing.
     pub fn get_vertex(&mut self, key: VertexKey) -> Result<Option<Arc<Vertex>>, StoreError> {
         if !self.vertices.contains_key(&key) {
             match self.store.get_vertex(key)? {
@@ -200,26 +257,22 @@ impl<S: GraphStore> LogicalGraph<S> {
     ///
     /// Returns `Result<(VertexKey, Arc<Vertex>), StoreError>` — the returned
     /// Arc gives immediate read access within this context.
+    /// Note:
+    ///     1. the vertex existence check is performed against both the overlay and the store to prevent duplicates.
     pub fn add_vertex(&mut self, id: VertexKey, label_id: LabelId) -> Result<(VertexKey, Arc<Vertex>), StoreError> {
         if self.vertices.contains_key(&id) {
             return Err(StoreError::DuplicateVertex(id));
         }
-        if self.store.get_vertex(id)?.is_some() {
+        // Use get_vertex_counts for a more efficient existence check.
+        if self.store.get_vertex_counts(id)?.is_some() {
             return Err(StoreError::DuplicateVertex(id));
         }
 
-        self.vertices.insert(
-            id,
-            Arc::new(Vertex {
-                id,
-                label_id,
-                out_e_cnt: AtomicU32::new(0),
-                in_e_cnt: AtomicU32::new(0),
-                props: RwLock::new(Vec::new()),
-            }),
-        );
+        let vertex = Arc::new(Vertex { id, label_id, props: RwLock::new(Vec::new()) });
+        self.vertices.insert(id, vertex.clone());
+        self.vertex_counts.insert(id, (0, 0));
         self.dirty.insert(CanonicalKey::Vertex(id), Existence::New);
-        Ok((id, self.vertices[&id].clone()))
+        Ok((id, vertex))
     }
 
     /// Register a new directed edge identified by `cek`.
@@ -238,19 +291,22 @@ impl<S: GraphStore> LogicalGraph<S> {
             return Err(StoreError::DuplicateEdge(cek));
         }
 
-        // Load vertices to update their edge counters
-        let src = self
-            .get_vertex(cek.src_id)?
-            .ok_or_else(|| StoreError::Other(format!("src vertex {} not found", cek.src_id)))?;
-        let dst = self
-            .get_vertex(cek.dst_id)?
-            .ok_or_else(|| StoreError::Other(format!("dst vertex {} not found", cek.dst_id)))?;
+        // Ensure vertices exist and update their edge counters
+        let (mut src_out, src_in) = self
+            .get_vertex_counts(cek.src_id)?
+            .ok_or_else(|| StoreError::Other(format!("src vertex {} has been deleted", cek.src_id)))?;
+        let (dst_out, mut dst_in) = self
+            .get_vertex_counts(cek.dst_id)?
+            .ok_or_else(|| StoreError::Other(format!("dst vertex {} has been deleted", cek.dst_id)))?;
 
-        src.out_e_cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        dst.in_e_cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        src_out += 1;
+        dst_in += 1;
 
-        self.dirty.entry(CanonicalKey::Vertex(cek.src_id)).or_insert(Existence::Modified);
-        self.dirty.entry(CanonicalKey::Vertex(cek.dst_id)).or_insert(Existence::Modified);
+        self.vertex_counts.insert(cek.src_id, (src_out, src_in));
+        self.mark_dirty(CanonicalKey::Vertex(cek.src_id), Existence::CounterOnly);
+
+        self.vertex_counts.insert(cek.dst_id, (dst_out, dst_in));
+        self.mark_dirty(CanonicalKey::Vertex(cek.dst_id), Existence::CounterOnly);
 
         // 2. insert new edge into overlay and mark dirty.  The store is not touched until commit.
         self.edges.insert(
@@ -289,7 +345,7 @@ impl<S: GraphStore> LogicalGraph<S> {
                         // upsert_prop(&mut Arc::make_mut(arc).props, key, prop, value),
                     }
                 }
-                self.dirty.entry(key).or_insert(Existence::Modified);
+                self.mark_dirty(key, Existence::Modified);
             }
             CanonicalKey::Edge(cek) => {
                 if self.dirty.get(&key) == Some(&Existence::Tombstone) {
@@ -302,7 +358,7 @@ impl<S: GraphStore> LogicalGraph<S> {
                         upsert_prop(&mut props, key, prop, value);
                     }
                 }
-                self.dirty.entry(key).or_insert(Existence::Modified);
+                self.mark_dirty(key, Existence::Modified);
             }
         }
         Ok(())
@@ -322,7 +378,7 @@ impl<S: GraphStore> LogicalGraph<S> {
                         props.retain(|p| &p.key != prop);
                     }
                 }
-                self.dirty.entry(key).or_insert(Existence::Modified);
+                self.mark_dirty(key, Existence::Modified);
             }
             CanonicalKey::Edge(cek) => {
                 if self.dirty.get(&key) == Some(&Existence::Tombstone) {
@@ -335,7 +391,7 @@ impl<S: GraphStore> LogicalGraph<S> {
                         props.retain(|p| &p.key != prop);
                     }
                 }
-                self.dirty.entry(key).or_insert(Existence::Modified);
+                self.mark_dirty(key, Existence::Modified);
             }
         }
         Ok(())
@@ -343,14 +399,15 @@ impl<S: GraphStore> LogicalGraph<S> {
 
     /// Mark a vertex or edge as deleted.
     ///
-    /// The element must have been previously loaded or created in this context.
+    /// Note:
+    ///     1.The element must have been previously loaded or created in this context.
     pub fn drop_element(&mut self, key: CanonicalKey) -> Result<(), StoreError> {
         match key {
             CanonicalKey::Vertex(id) => {
-                let v = self.vertices.get(&id).ok_or_else(|| StoreError::Other(format!("vertex {id} not loaded")))?;
-                if v.out_e_cnt.load(std::sync::atomic::Ordering::Relaxed) > 0
-                    || v.in_e_cnt.load(std::sync::atomic::Ordering::Relaxed) > 0
-                {
+                let (out_e, in_e) = self
+                    .get_vertex_counts(id)?
+                    .ok_or_else(|| StoreError::Other(format!("vertex {id} has been deleted")))?;
+                if out_e > 0 || in_e > 0 {
                     return Err(StoreError::Other("cannot drop vertex with incident edges".into()));
                 }
                 self.dirty.insert(key, Existence::Tombstone);
@@ -361,13 +418,15 @@ impl<S: GraphStore> LogicalGraph<S> {
                 }
                 if self.dirty.get(&key) != Some(&Existence::Tombstone) {
                     self.dirty.insert(key, Existence::Tombstone);
-                    if let Some(src) = self.get_vertex(cek.src_id)? {
-                        src.out_e_cnt.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        self.dirty.entry(CanonicalKey::Vertex(cek.src_id)).or_insert(Existence::Modified);
+                    if let Some((mut out_e, in_e)) = self.get_vertex_counts(cek.src_id)? {
+                        out_e = out_e.saturating_sub(1);
+                        self.vertex_counts.insert(cek.src_id, (out_e, in_e));
+                        self.mark_dirty(CanonicalKey::Vertex(cek.src_id), Existence::CounterOnly);
                     }
-                    if let Some(dst) = self.get_vertex(cek.dst_id)? {
-                        dst.in_e_cnt.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        self.dirty.entry(CanonicalKey::Vertex(cek.dst_id)).or_insert(Existence::Modified);
+                    if let Some((out_e, mut in_e)) = self.get_vertex_counts(cek.dst_id)? {
+                        in_e = in_e.saturating_sub(1);
+                        self.vertex_counts.insert(cek.dst_id, (out_e, in_e));
+                        self.mark_dirty(CanonicalKey::Vertex(cek.dst_id), Existence::CounterOnly);
                     }
                 }
             }
@@ -387,29 +446,39 @@ impl<S: GraphStore> LogicalGraph<S> {
         let dirty: Vec<(CanonicalKey, Existence)> = self.dirty.iter().map(|(&k, &v)| (k, v)).collect();
         for (key, existence) in dirty {
             match (key, existence) {
-                (CanonicalKey::Vertex(id), Existence::New | Existence::Modified) => {
+                (CanonicalKey::Vertex(id), Existence::New) => {
                     let v = self.vertices.get(&id).expect("dirty vertex key not in vertices");
-                    // 1. Acquire a read lock
                     let props_guard = v.props.read().map_err(|_| StoreError::LockError)?;
-
-                    // 2. Pass the guard (it derefs to &Vec<Property>, which matches &[Property])
-                    self.store.put_vertex(
-                        id,
-                        v.label_id,
-                        v.out_e_cnt.load(std::sync::atomic::Ordering::Relaxed),
-                        v.in_e_cnt.load(std::sync::atomic::Ordering::Relaxed),
-                        &props_guard,
-                    )?;
+                    self.store.put_vertex(id, v.label_id, &props_guard)?;
+                    let (out_e, in_e) = self.vertex_counts[&id];
+                    self.store.put_vertex_counts(id, out_e, in_e)?;
+                }
+                (CanonicalKey::Vertex(id), Existence::Modified) => {
+                    let v = self.vertices.get(&id).expect("dirty vertex key not in vertices");
+                    let props_guard = v.props.read().map_err(|_| StoreError::LockError)?;
+                    self.store.put_vertex(id, v.label_id, &props_guard)?;
+                }
+                (CanonicalKey::Vertex(id), Existence::CounterOnly) => {
+                    let (out_e, in_e) = self.vertex_counts[&id];
+                    self.store.put_vertex_counts(id, out_e, in_e)?;
+                }
+                (CanonicalKey::Vertex(id), Existence::ModifiedWithCounter) => {
+                    let v = self.vertices.get(&id).expect("dirty vertex key not in vertices");
+                    let props_guard = v.props.read().map_err(|_| StoreError::LockError)?;
+                    self.store.put_vertex(id, v.label_id, &props_guard)?;
+                    let (out_e, in_e) = self.vertex_counts[&id];
+                    self.store.put_vertex_counts(id, out_e, in_e)?;
                 }
                 (CanonicalKey::Vertex(id), Existence::Tombstone) => {
                     self.store.delete_vertex(id)?;
+                    self.store.delete_vertex_counts(id)?;
                 }
-                (CanonicalKey::Edge(cek), Existence::New | Existence::Modified) => {
+                (
+                    CanonicalKey::Edge(cek),
+                    Existence::New | Existence::Modified | Existence::CounterOnly | Existence::ModifiedWithCounter,
+                ) => {
                     let e = self.edges.get(&cek).expect("dirty edge key not in edges");
-                    // 1. Acquire a read lock
                     let props_guard = e.props.read().map_err(|_| StoreError::LockError)?;
-
-                    // 2. Pass the guard (it derefs to &Vec<Property>, which matches &[Property])
                     self.store.put_edge(cek, Direction::OUT, &props_guard)?;
                     self.store.put_edge(cek, Direction::IN, &props_guard)?;
                 }
@@ -434,6 +503,7 @@ impl<S: GraphStore> LogicalGraph<S> {
         self.dirty.clear();
         self.vertices.clear();
         self.edges.clear();
+        self.vertex_counts.clear();
     }
 }
 
@@ -583,7 +653,20 @@ mod tests {
     }
 
     #[test]
-    fn add_edge_vs_add_edge_handmade() {
+    fn add_duplicated_edge_in_mem_should_fail() {
+        let (store, _dir) = open();
+        let mut c = ctx(&store);
+        let (v1, _) = c.add_vertex(1, 1).unwrap();
+        let (v2, _) = c.add_vertex(2, 1).unwrap();
+        let k = cek(v1, 5, v2);
+        c.add_edge(k).unwrap();
+
+        let result = c.add_edge(k);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn add_edge_vs_add_same_edge_handmade() {
         let (store, _dir) = open();
         let mut c0 = ctx(&store);
         let (v1, _) = c0.add_vertex(1, 1).unwrap();
@@ -831,6 +914,9 @@ mod tests {
         let (store, _dir) = open();
         let mut c = ctx(&store);
         let (key, _) = c.add_vertex(100, 1).unwrap();
+        let v = c.get_vertex(key).unwrap().unwrap();
+        assert_eq!(v.id, key);
+        assert_eq!(v.label_id, 1);
         c.drop_element(CanonicalKey::Vertex(key)).unwrap();
         assert!(c.get_vertex(key).unwrap().is_none());
     }
@@ -843,6 +929,8 @@ mod tests {
         let (v2, _) = c.add_vertex(2, 1).unwrap();
         let k = cek(v1, 5, v2);
         c.add_edge(k).unwrap();
+        let e = c.get_edge(k).unwrap().unwrap();
+        assert_eq!(e.canonical_key(), k);
         c.drop_element(CanonicalKey::Edge(k)).unwrap();
         assert!(c.get_edge(k).unwrap().is_none());
     }
@@ -859,6 +947,14 @@ mod tests {
         let err = c.drop_element(CanonicalKey::Vertex(v1));
         assert!(err.is_err());
         assert_eq!(err.unwrap_err().to_string(), "cannot drop vertex with incident edges");
+
+        c.commit().unwrap();
+
+        let mut c2 = ctx(&store);
+        let _e = c2.get_vertex(v1).unwrap().unwrap();
+        let err = c2.drop_element(CanonicalKey::Vertex(v1));
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().to_string(), "cannot drop vertex with incident edges");
     }
 
     #[test]
@@ -869,6 +965,7 @@ mod tests {
         c.drop_element(CanonicalKey::Vertex(key)).unwrap();
         let err = c.set_property(CanonicalKey::Vertex(key), SmolStr::new("x"), Primitive::Int32(1));
         assert!(err.is_err());
+        assert_eq!(err.unwrap_err().to_string(), "element is tombstoned");
     }
 
     #[test]
@@ -1308,6 +1405,49 @@ mod tests {
     mod conflict_matrix {
         use super::*;
 
+        fn run_non_conflict<State: Copy, Setup, Op1, Op2>(setup: Setup, op1: Op1, op2: Op2)
+        where
+            Setup: Fn(&mut LogicalGraph<RocksStorage>) -> State,
+            Op1: Fn(&mut LogicalGraph<RocksStorage>, State),
+            Op2: Fn(&mut LogicalGraph<RocksStorage>, State),
+        {
+            // Order 1: Txn1 commits, Txn2 conflicts
+            {
+                let (store, _dir) = open();
+                let mut c0 = ctx(&store);
+                let state = setup(&mut c0);
+                c0.commit().unwrap();
+
+                let mut c1 = ctx(&store);
+                let mut c2 = ctx(&store);
+
+                op1(&mut c1, state);
+                op2(&mut c2, state);
+
+                c1.commit().unwrap();
+                let res = c2.commit();
+                assert!(res.is_ok(), "unexpected conflict in non-conflicting operations. Order 1 (Txn1 commits, Txn2 should succeed) failed with error: {:?}", res.err());
+            }
+
+            // Order 2: Txn2 commits, Txn1 conflicts
+            {
+                let (store, _dir) = open();
+                let mut c0 = ctx(&store);
+                let state = setup(&mut c0);
+                c0.commit().unwrap();
+
+                let mut c1 = ctx(&store);
+                let mut c2 = ctx(&store);
+
+                op1(&mut c1, state);
+                op2(&mut c2, state);
+
+                c2.commit().unwrap();
+                let res = c1.commit();
+                assert!(res.is_ok(), "unexpected conflict in non-conflicting operations. Order 2 (Txn2 commits, Txn1 should succeed) failed with error: {:?}", res.err());
+            }
+        }
+
         fn run_conflict<State: Copy, Setup, Op1, Op2>(setup: Setup, op1: Op1, op2: Op2)
         where
             Setup: Fn(&mut LogicalGraph<RocksStorage>) -> State,
@@ -1377,6 +1517,24 @@ mod tests {
         }
 
         #[test]
+        fn add_edge_vs_add_edge_with_same_vertex() {
+            run_conflict(
+                |c| {
+                    let (v1, _) = c.add_vertex(1, 1).unwrap();
+                    let (v2, _) = c.add_vertex(2, 1).unwrap();
+                    let (v3, _) = c.add_vertex(3, 1).unwrap();
+                    (v1, v2, v3)
+                },
+                |c, (v1, v2, _v3)| {
+                    c.add_edge(cek(v1, 5, v2)).unwrap();
+                },
+                |c, (v1, _v2, v3)| {
+                    c.add_edge(cek(v1, 5, v3)).unwrap();
+                },
+            );
+        }
+
+        #[test]
         fn add_edge_vs_drop_edge() {
             run_conflict(
                 |c| {
@@ -1398,8 +1556,29 @@ mod tests {
         }
 
         #[test]
-        fn add_edge_vs_set_vertex_property() {
+        fn add_edge_vs_drop_edge_with_same_vertex() {
             run_conflict(
+                |c| {
+                    let (v1, _) = c.add_vertex(1, 1).unwrap();
+                    let (v2, _) = c.add_vertex(2, 1).unwrap();
+                    let (v3, _) = c.add_vertex(3, 1).unwrap();
+                    let e1 = cek(v1, 5, v2);
+                    c.add_edge(e1).unwrap();
+                    (v1, e1, v3)
+                },
+                |c, (v1, _, v3)| {
+                    c.add_edge(cek(v1, 6, v3)).unwrap();
+                },
+                |c, (_, e1, _)| {
+                    c.get_edge(e1).unwrap();
+                    c.drop_element(CanonicalKey::Edge(e1)).unwrap();
+                },
+            );
+        }
+
+        #[test]
+        fn add_edge_vs_set_vertex_property() {
+            run_non_conflict(
                 |c| {
                     let (v1, _) = c.add_vertex(1, 1).unwrap();
                     let (v2, _) = c.add_vertex(2, 1).unwrap();
@@ -1417,7 +1596,7 @@ mod tests {
 
         #[test]
         fn add_edge_vs_drop_vertex_property() {
-            run_conflict(
+            run_non_conflict(
                 |c| {
                     let (v1, _) = c.add_vertex(1, 1).unwrap();
                     c.set_property(CanonicalKey::Vertex(v1), SmolStr::new("x"), Primitive::Int32(1)).unwrap();
@@ -1474,6 +1653,30 @@ mod tests {
         }
 
         #[test]
+        fn drop_edge_vs_drop_edge_with_same_vertex() {
+            run_conflict(
+                |c| {
+                    let (v1, _) = c.add_vertex(1, 1).unwrap();
+                    let (v2, _) = c.add_vertex(2, 1).unwrap();
+                    let (v3, _) = c.add_vertex(3, 1).unwrap();
+                    let e = cek(v1, 5, v2);
+                    let e2 = cek(v1, 6, v3);
+                    c.add_edge(e).unwrap();
+                    c.add_edge(e2).unwrap();
+                    (e, e2)
+                },
+                |c, (e1, _e2): (CanonicalEdgeKey, CanonicalEdgeKey)| {
+                    c.get_edge(e1).unwrap();
+                    c.drop_element(CanonicalKey::Edge(e1)).unwrap();
+                },
+                |c, (_e1, e2): (CanonicalEdgeKey, CanonicalEdgeKey)| {
+                    c.get_edge(e2).unwrap();
+                    c.drop_element(CanonicalKey::Edge(e2)).unwrap();
+                },
+            );
+        }
+
+        #[test]
         fn drop_edge_vs_set_edge_property() {
             run_conflict(
                 |c| {
@@ -1518,7 +1721,7 @@ mod tests {
 
         #[test]
         fn drop_edge_vs_set_vertex_property() {
-            run_conflict(
+            run_non_conflict(
                 |c| {
                     let (v1, _) = c.add_vertex(1, 1).unwrap();
                     let (v2, _) = c.add_vertex(2, 1).unwrap();
@@ -1539,7 +1742,7 @@ mod tests {
 
         #[test]
         fn drop_edge_vs_drop_vertex_property() {
-            run_conflict(
+            run_non_conflict(
                 |c| {
                     let (v1, _) = c.add_vertex(1, 1).unwrap();
                     c.set_property(CanonicalKey::Vertex(v1), SmolStr::new("x"), Primitive::Int32(1)).unwrap();
@@ -1581,6 +1784,30 @@ mod tests {
         }
 
         #[test]
+        fn set_edge_property_vs_set_edge_property_with_same_vertex() {
+            run_non_conflict(
+                |c| {
+                    let (v1, _) = c.add_vertex(1, 1).unwrap();
+                    let (v2, _) = c.add_vertex(2, 1).unwrap();
+                    let (v3, _) = c.add_vertex(3, 1).unwrap();
+                    let e = cek(v1, 5, v2);
+                    let e2 = cek(v1, 6, v3);
+                    c.add_edge(e).unwrap();
+                    c.add_edge(e2).unwrap();
+                    (e, e2)
+                },
+                |c, (e1, _e2): (CanonicalEdgeKey, CanonicalEdgeKey)| {
+                    c.get_edge(e1).unwrap();
+                    c.set_property(CanonicalKey::Edge(e1), SmolStr::new("x"), Primitive::Int32(1)).unwrap();
+                },
+                |c, (_e1, e2): (CanonicalEdgeKey, CanonicalEdgeKey)| {
+                    c.get_edge(e2).unwrap();
+                    c.set_property(CanonicalKey::Edge(e2), SmolStr::new("y"), Primitive::Int32(2)).unwrap();
+                },
+            );
+        }
+
+        #[test]
         fn set_edge_property_vs_drop_edge_property() {
             run_conflict(
                 |c| {
@@ -1603,6 +1830,32 @@ mod tests {
         }
 
         #[test]
+        fn set_edge_property_vs_drop_edge_property_with_same_vertex() {
+            run_non_conflict(
+                |c| {
+                    let (v1, _) = c.add_vertex(1, 1).unwrap();
+                    let (v2, _) = c.add_vertex(2, 1).unwrap();
+                    let (v3, _) = c.add_vertex(3, 1).unwrap();
+                    let e = cek(v1, 5, v2);
+                    let e2 = cek(v1, 6, v3);
+                    c.add_edge(e).unwrap();
+                    c.add_edge(e2).unwrap();
+                    c.set_property(CanonicalKey::Edge(e), SmolStr::new("x"), Primitive::Int32(1)).unwrap();
+                    c.set_property(CanonicalKey::Edge(e2), SmolStr::new("y"), Primitive::Int32(2)).unwrap();
+                    (e, e2)
+                },
+                |c, (e1, _e2): (CanonicalEdgeKey, CanonicalEdgeKey)| {
+                    c.get_edge(e1).unwrap();
+                    c.set_property(CanonicalKey::Edge(e1), SmolStr::new("x"), Primitive::Int32(2)).unwrap();
+                },
+                |c, (_e1, e2): (CanonicalEdgeKey, CanonicalEdgeKey)| {
+                    c.get_edge(e2).unwrap();
+                    c.drop_property(CanonicalKey::Edge(e2), &SmolStr::new("y")).unwrap();
+                },
+            );
+        }
+
+        #[test]
         fn drop_edge_property_vs_drop_edge_property() {
             run_conflict(
                 |c| {
@@ -1620,6 +1873,32 @@ mod tests {
                 |c, e| {
                     c.get_edge(e).unwrap();
                     c.drop_property(CanonicalKey::Edge(e), &SmolStr::new("x")).unwrap();
+                },
+            );
+        }
+
+        #[test]
+        fn drop_edge_property_vs_drop_edge_property_with_same_vertex() {
+            run_non_conflict(
+                |c| {
+                    let (v1, _) = c.add_vertex(1, 1).unwrap();
+                    let (v2, _) = c.add_vertex(2, 1).unwrap();
+                    let (v3, _) = c.add_vertex(3, 1).unwrap();
+                    let e = cek(v1, 5, v2);
+                    let e2 = cek(v1, 6, v3);
+                    c.add_edge(e).unwrap();
+                    c.add_edge(e2).unwrap();
+                    c.set_property(CanonicalKey::Edge(e), SmolStr::new("x"), Primitive::Int32(1)).unwrap();
+                    c.set_property(CanonicalKey::Edge(e2), SmolStr::new("y"), Primitive::Int32(2)).unwrap();
+                    (e, e2)
+                },
+                |c, (e1, _e2): (CanonicalEdgeKey, CanonicalEdgeKey)| {
+                    c.get_edge(e1).unwrap();
+                    c.drop_property(CanonicalKey::Edge(e1), &SmolStr::new("x")).unwrap();
+                },
+                |c, (_e1, e2): (CanonicalEdgeKey, CanonicalEdgeKey)| {
+                    c.get_edge(e2).unwrap();
+                    c.drop_property(CanonicalKey::Edge(e2), &SmolStr::new("y")).unwrap();
                 },
             );
         }
@@ -1764,6 +2043,13 @@ mod tests {
         let mut c = ctx(&store);
         let out = c.get_edges(hub, Direction::OUT, Some(1), None).unwrap();
         assert_eq!(out.len(), 4);
+
+        // check vertex counter is correct after multiple contexts
+        let (out_e, in_e) = c.get_vertex_counts_for_test(hub).unwrap().unwrap();
+        assert_eq!(out_e, 4);
+        assert_eq!(in_e, 0);
+
+        // The 4 edges must land at the 4 spoke vertices.
         let mut dst_ids: Vec<u64> = out.iter().map(|(ek, _)| ek.secondary_id).collect();
         dst_ids.sort_unstable();
         let mut expected = spokes.clone();
@@ -1835,14 +2121,23 @@ mod tests {
         assert_eq!(alice_idx.label_id, 1);
         assert_eq!(prop(&alice_idx, "name"), Some(Primitive::String(SmolStr::new("Alice"))));
         assert_eq!(prop(&alice_idx, "age"), Some(Primitive::Int32(30)));
+        let (alice_out_e, alice_in_e) = c.get_vertex_counts_for_test(alice).unwrap().unwrap();
+        assert_eq!(alice_out_e, 1);
+        assert_eq!(alice_in_e, 0);
 
         let bob_idx = c.get_vertex(bob).unwrap().unwrap();
         assert_eq!(bob_idx.label_id, 1);
         assert_eq!(prop(&bob_idx, "name"), Some(Primitive::String(SmolStr::new("Bob"))));
+        let (bob_out_e, bob_in_e) = c.get_vertex_counts_for_test(bob).unwrap().unwrap();
+        assert_eq!(bob_out_e, 1);
+        assert_eq!(bob_in_e, 0);
 
         let london_idx = c.get_vertex(london).unwrap().unwrap();
         assert_eq!(london_idx.label_id, 2);
         assert_eq!(prop(&london_idx, "name"), Some(Primitive::String(SmolStr::new("London"))));
+        let (london_out_e, london_in_e) = c.get_vertex_counts_for_test(london).unwrap().unwrap();
+        assert_eq!(london_out_e, 0);
+        assert_eq!(london_in_e, 2);
 
         // Both outgoing "lives_in" edges from Alice land at London.
         let alice_out = c.get_edges(alice, Direction::OUT, Some(2), None).unwrap();
@@ -1857,5 +2152,17 @@ mod tests {
         let mut src_ids: Vec<u64> = london_in.iter().map(|(ek, _)| ek.secondary_id).collect();
         src_ids.sort_unstable();
         assert_eq!(src_ids, vec![alice.min(bob), alice.max(bob)]);
+    }
+
+    // -- Runnint time get_vertex_counts fails if vertex doesn't exist, so this tests that the vertex still exists after multiple contexts mutate it.
+    #[test]
+    fn get_vertex_get_counters_failed() {
+        // step 1, insert a vertex and set properties, commit the context txn1
+
+        // step 2, in a new context txn2, get_vertex
+
+        // step 3, the vertex was deleted in another context, commit the deleting context which should succeed
+
+        // step 4, get_counter in txn2 should fail, but get_vertex should succeed and return the vertex with zero counters
     }
 }

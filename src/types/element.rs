@@ -14,10 +14,7 @@ use crate::types::{
     gvalue::Property,
     keys::{CanonicalEdgeKey, LabelId, Rank, VertexKey},
 };
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    RwLock,
-};
+use std::sync::RwLock;
 
 // ── Vertex ────────────────────────────────────────────────────────────────
 
@@ -31,10 +28,6 @@ use std::sync::{
 pub struct Vertex {
     pub id: VertexKey,
     pub label_id: LabelId,
-    /// Counter for outgoing edges, updated within the graph context.
-    pub out_e_cnt: AtomicU32,
-    /// Counter for incoming edges, updated within the graph context.
-    pub in_e_cnt: AtomicU32,
     pub props: RwLock<Vec<Property>>, // Mutated via lock, while counters use atomic interior mutability
 }
 
@@ -65,11 +58,7 @@ impl Edge {
 impl PartialEq for Vertex {
     fn eq(&self, other: &Self) -> bool {
         // Compare basic fields
-        if self.id != other.id
-            || self.label_id != other.label_id
-            || self.out_e_cnt.load(Ordering::Relaxed) != other.out_e_cnt.load(Ordering::Relaxed)
-            || self.in_e_cnt.load(Ordering::Relaxed) != other.in_e_cnt.load(Ordering::Relaxed)
-        {
+        if self.id != other.id || self.label_id != other.label_id {
             return false;
         }
 
