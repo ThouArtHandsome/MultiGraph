@@ -20,7 +20,7 @@
 //! | CF name         | Key layout                               | Value layout                        |
 //! |-----------------|------------------------------------------|-------------------------------------|
 //! | `vertices`      | `[ VertexId:u64 ]`                       | `[ label_id:u16 \| props ]`         |
-//! | `vertex_counts` | `[ VertexId:u64 ]`                       | `[ out_e_cnt:u32 \| in_e_cnt:u32 ]` |
+//! | `vertex_degree` | `[ VertexId:u64 ]`                       | `[ out_e_cnt:u32 \| in_e_cnt:u32 ]` |
 //! | `edges_out`     | `[ SrcId:u64 \| LabelId:u16 \| Rank:u16 \| DstId:u64 ]` | `[ props ]` |
 //! | `edges_in`      | `[ DstId:u64 \| LabelId:u16 \| Rank:u16 \| SrcId:u64 ]` | `[ props ]` |
 //!
@@ -68,7 +68,7 @@ pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 // ── Column-family name constants ──────────────────────────────────────────────
 
 pub const CF_VERTICES: &str = "vertices";
-pub const CF_VERTEX_COUNTS: &str = "vertex_counts";
+pub const CF_VERTEX_DEGREE: &str = "vertex_degree";
 pub const CF_EDGES_OUT: &str = "edges_out";
 pub const CF_EDGES_IN: &str = "edges_in";
 
@@ -173,16 +173,19 @@ impl VertexValue {
     }
 }
 
-// ── VertexCounts ──────────────────────────────────────────────────────────────
+// ── VertexDegree ──────────────────────────────────────────────────────────────
 
-/// `[ out_e_cnt:u32 | in_e_cnt:u32 ]` — value in the `vertex_counts` CF.
+/// `[ out_e_cnt:u32 | in_e_cnt:u32 ]` — value in the `vertex_degree` CF.
+///
+/// Stores the out-degree and in-degree for a vertex, used to enforce the
+/// invariant that a vertex cannot be dropped while it has incident edges.
 #[derive(Debug, Clone)]
-pub struct VertexCounts {
+pub struct VertexDegree {
     pub out_e_cnt: u32,
     pub in_e_cnt: u32,
 }
 
-impl VertexCounts {
+impl VertexDegree {
     pub fn encode(&self) -> [u8; 8] {
         let mut buf = [0u8; 8];
         buf[0..4].copy_from_slice(&self.out_e_cnt.to_be_bytes());
@@ -227,7 +230,7 @@ mod tests {
 
     use super::{
         decode_edge_key_in, decode_edge_key_out, decode_vertex_key, encode_edge_key_in, encode_edge_key_out,
-        encode_vertex_key, EdgeValue, VertexCounts, VertexValue,
+        encode_vertex_key, EdgeValue, VertexDegree, VertexValue,
     };
     use crate::types::{
         element::{Edge, Vertex},
@@ -425,22 +428,22 @@ mod tests {
         assert!(VertexValue::decode(&[]).is_none());
     }
 
-    // ── VertexCounts ──────────────────────────────────────────────────────────
+    // ── VertexDegree ──────────────────────────────────────────────────────────
 
     #[test]
-    fn vertex_counts_encode_decode() {
-        let vc = VertexCounts { out_e_cnt: 10, in_e_cnt: 20 };
-        let bytes = vc.encode();
+    fn vertex_degree_encode_decode() {
+        let vd = VertexDegree { out_e_cnt: 10, in_e_cnt: 20 };
+        let bytes = vd.encode();
         assert_eq!(bytes.len(), 8);
-        let dec = VertexCounts::decode(&bytes).unwrap();
+        let dec = VertexDegree::decode(&bytes).unwrap();
         assert_eq!(dec.out_e_cnt, 10);
         assert_eq!(dec.in_e_cnt, 20);
     }
 
     #[test]
-    fn vertex_counts_decode_bad_length() {
-        assert!(VertexCounts::decode(&[0u8; 7]).is_none());
-        assert!(VertexCounts::decode(&[0u8; 9]).is_none());
+    fn vertex_degree_decode_bad_length() {
+        assert!(VertexDegree::decode(&[0u8; 7]).is_none());
+        assert!(VertexDegree::decode(&[0u8; 9]).is_none());
     }
 
     // ── Full roundtrips ───────────────────────────────────────────────────────

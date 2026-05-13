@@ -17,7 +17,7 @@ use rocksdb::{ColumnFamilyDescriptor, OptimisticTransactionDB, Options};
 use crate::{
     store::{
         rocks::{
-            encoding::{CF_EDGES_IN, CF_EDGES_OUT, CF_VERTEX_COUNTS, CF_VERTICES},
+            encoding::{CF_EDGES_IN, CF_EDGES_OUT, CF_VERTEX_DEGREE, CF_VERTICES},
             transaction::Transaction,
         },
         traits::GraphStore,
@@ -36,20 +36,19 @@ pub struct RocksStorage {
 impl RocksStorage {
     /// Open (or create) the database at `path`.
     ///
-    /// Creates all three column families if they do not exist yet, and
-    /// initialises a 16-shard × 1 024-entry LRU vertex cache.
+    /// Creates all four column families if they do not exist yet:
+    /// `vertices`, `vertex_degree`, `edges_out`, and `edges_in`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
-        let cfs = [CF_VERTICES, CF_VERTEX_COUNTS, CF_EDGES_OUT, CF_EDGES_IN]
+        let cfs = [CF_VERTICES, CF_VERTEX_DEGREE, CF_EDGES_OUT, CF_EDGES_IN]
             .into_iter()
             .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
             .collect::<Vec<_>>();
 
-        let db = OptimisticTransactionDB::open_cf_descriptors(&opts, path, cfs)
-            .map_err(|e| StoreError::Other(e.to_string()))?;
+        let db = OptimisticTransactionDB::open_cf_descriptors(&opts, path, cfs).map_err(StoreError::RocksDb)?;
 
         Ok(Self { db: Arc::new(db) })
     }

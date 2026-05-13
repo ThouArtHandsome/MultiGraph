@@ -31,8 +31,8 @@ use crate::{
     store::rocks::{
         encoding::{
             decode_edge_key_in, decode_edge_key_out, edge_scan_prefix, encode_edge_key_in, encode_edge_key_out,
-            encode_vertex_key, prefix_upper_bound, EdgeValue, VertexCounts, VertexValue, CF_EDGES_IN, CF_EDGES_OUT,
-            CF_VERTEX_COUNTS, CF_VERTICES,
+            encode_vertex_key, prefix_upper_bound, EdgeValue, VertexDegree, VertexValue, CF_EDGES_IN, CF_EDGES_OUT,
+            CF_VERTEX_DEGREE, CF_VERTICES,
         },
         store::RocksStorage,
     },
@@ -96,7 +96,7 @@ pub(super) fn encode_props(props: &[Property]) -> Vec<u8> {
 }
 
 /// Deserialize a property blob produced by `encode_props`.  Returns `None` on
-/// any structural error so callers can surface a `StoreError::Other`.
+/// any structural error so callers can surface a `StoreError::CorruptData`.
 pub(super) fn decode_props(blob: &[u8], owner: CanonicalKey) -> Option<Vec<Property>> {
     if blob.len() < 2 {
         return None;
@@ -192,19 +192,17 @@ pub(super) fn decode_props(blob: &[u8], owner: CanonicalKey) -> Option<Vec<Prope
 
 // ── Element builders ──────────────────────────────────────────────────────────
 
-/// Decode a `VertexValue` and `VertexCounts` from storage into a `Vertex`.
+/// Decode a `VertexValue` from storage into a `Vertex`.
 pub(super) fn build_full_vertex(id: VertexKey, vv: &VertexValue) -> Result<Vertex, StoreError> {
     let owner = CanonicalKey::Vertex(id);
-    let props = decode_props(&vv.property_blob, owner)
-        .ok_or_else(|| StoreError::Other("corrupt vertex property blob".into()))?;
+    let props = decode_props(&vv.property_blob, owner).ok_or(StoreError::CorruptData("vertex property blob"))?;
     Ok(Vertex { id, label_id: vv.label_id, props: RwLock::new(props) })
 }
 
 /// Decode an `EdgeValue` from storage into an `Edge`.
 pub(super) fn build_full_edge(cek: CanonicalEdgeKey, ev: &EdgeValue) -> Result<Edge, StoreError> {
     let owner = CanonicalKey::Edge(cek);
-    let props =
-        decode_props(&ev.property_blob, owner).ok_or_else(|| StoreError::Other("corrupt edge property blob".into()))?;
+    let props = decode_props(&ev.property_blob, owner).ok_or(StoreError::CorruptData("edge property blob"))?;
     Ok(Edge {
         src_id: cek.src_id,
         label_id: cek.label_id,
@@ -221,14 +219,11 @@ pub(super) fn build_full_edge(cek: CanonicalEdgeKey, ev: &EdgeValue) -> Result<E
 #[allow(dead_code)]
 impl RocksStorage {
     pub(crate) fn get_vertex(&self, key: VertexKey) -> Result<Option<Vertex>, StoreError> {
-        let cf_vertices =
-            self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
-        let vv_raw =
-            self.db.get_cf(&cf_vertices, encode_vertex_key(key)).map_err(|e| StoreError::Other(e.to_string()))?;
+        let cf_vertices = self.db.cf_handle(CF_VERTICES).ok_or(StoreError::MissingColumnFamily("vertices"))?;
+        let vv_raw = self.db.get_cf(&cf_vertices, encode_vertex_key(key)).map_err(StoreError::RocksDb)?;
         match vv_raw {
             Some(vv_bytes) => {
-                let vv =
-                    VertexValue::decode(&vv_bytes).ok_or_else(|| StoreError::Other("corrupt vertex value".into()))?;
+                let vv = VertexValue::decode(&vv_bytes).ok_or(StoreError::CorruptData("vertex value"))?;
                 Ok(Some(build_full_vertex(key, &vv)?))
             }
             _ => Ok(None),
@@ -236,15 +231,12 @@ impl RocksStorage {
     }
 
     pub(crate) fn get_vertices(&self, keys: &[VertexKey]) -> Result<Vec<Vertex>, StoreError> {
-        let cf_vertices =
-            self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
+        let cf_vertices = self.db.cf_handle(CF_VERTICES).ok_or(StoreError::MissingColumnFamily("vertices"))?;
         let mut result = Vec::with_capacity(keys.len());
         for &key in keys {
-            let vv_raw =
-                self.db.get_cf(&cf_vertices, encode_vertex_key(key)).map_err(|e| StoreError::Other(e.to_string()))?;
+            let vv_raw = self.db.get_cf(&cf_vertices, encode_vertex_key(key)).map_err(StoreError::RocksDb)?;
             if let Some(vv_bytes) = vv_raw {
-                let vv =
-                    VertexValue::decode(&vv_bytes).ok_or_else(|| StoreError::Other("corrupt vertex value".into()))?;
+                let vv = VertexValue::decode(&vv_bytes).ok_or(StoreError::CorruptData("vertex value"))?;
                 result.push(build_full_vertex(key, &vv)?);
             }
         }
@@ -256,8 +248,8 @@ impl RocksStorage {
             Direction::OUT => (CF_EDGES_OUT, encode_edge_key_out(key)),
             Direction::IN => (CF_EDGES_IN, encode_edge_key_in(key)),
         };
-        let cf = self.db.cf_handle(cf_name).ok_or_else(|| StoreError::Other(format!("missing CF: {cf_name}")))?;
-        match self.db.get_cf(&cf, key_bytes).map_err(|e| StoreError::Other(e.to_string()))? {
+        let cf = self.db.cf_handle(cf_name).ok_or(StoreError::MissingColumnFamily(cf_name))?;
+        match self.db.get_cf(&cf, key_bytes).map_err(StoreError::RocksDb)? {
             None => Ok(None),
             Some(raw) => Ok(Some(build_full_edge(key, &EdgeValue::decode(&raw))?)),
         }
@@ -274,7 +266,7 @@ impl RocksStorage {
             Direction::OUT => (CF_EDGES_OUT, decode_edge_key_out),
             Direction::IN => (CF_EDGES_IN, decode_edge_key_in),
         };
-        let cf = self.db.cf_handle(cf_name).ok_or_else(|| StoreError::Other(format!("missing CF: {cf_name}")))?;
+        let cf = self.db.cf_handle(cf_name).ok_or(StoreError::MissingColumnFamily(cf_name))?;
 
         let prefix = edge_scan_prefix(vertex, label);
         let mut read_opts = ReadOptions::default();
@@ -287,11 +279,11 @@ impl RocksStorage {
 
         let mut result = Vec::new();
         for item in iter {
-            let (key_bytes, val_bytes) = item.map_err(|e| StoreError::Other(e.to_string()))?;
+            let (key_bytes, val_bytes) = item.map_err(StoreError::RocksDb)?;
             if !key_bytes.starts_with(&prefix) {
                 break;
             }
-            let cek = decode_fn(&key_bytes).ok_or_else(|| StoreError::Other("corrupt edge key".into()))?;
+            let cek = decode_fn(&key_bytes).ok_or(StoreError::CorruptData("edge key"))?;
             if let Some(ref set) = dst_set {
                 let remote = match direction {
                     Direction::OUT => cek.dst_id,
@@ -312,19 +304,17 @@ impl RocksStorage {
     // `WriteBatch` (TRANSACTION=false) is a compile-time type mismatch.
 
     pub(crate) fn insert_vertices(&mut self, vertices: &[Vertex]) -> Result<(), StoreError> {
-        let cf_vertices =
-            self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
-        let cf_counts =
-            self.db.cf_handle(CF_VERTEX_COUNTS).ok_or_else(|| StoreError::Other("missing CF: vertex_counts".into()))?;
+        let cf_vertices = self.db.cf_handle(CF_VERTICES).ok_or(StoreError::MissingColumnFamily("vertices"))?;
+        let cf_degree = self.db.cf_handle(CF_VERTEX_DEGREE).ok_or(StoreError::MissingColumnFamily("vertex_degree"))?;
         let mut batch = WriteBatchWithTransaction::<true>::default();
         for vv in vertices {
             let guard_props = vv.props.read().map_err(|_| StoreError::LockError)?;
             let val = VertexValue { label_id: vv.label_id, property_blob: encode_props(&guard_props) };
-            let counts = VertexCounts { out_e_cnt: 0, in_e_cnt: 0 };
+            let degree = VertexDegree { out_e_cnt: 0, in_e_cnt: 0 };
             batch.put_cf(&cf_vertices, encode_vertex_key(vv.id), val.encode());
-            batch.put_cf(&cf_counts, encode_vertex_key(vv.id), counts.encode());
+            batch.put_cf(&cf_degree, encode_vertex_key(vv.id), degree.encode());
         }
-        self.db.write(batch).map_err(|e| StoreError::Other(e.to_string()))
+        self.db.write(batch).map_err(StoreError::RocksDb)
     }
 
     pub(crate) fn insert_edges(&mut self, edges: &[Edge], direction: Direction) -> Result<(), StoreError> {
@@ -332,7 +322,7 @@ impl RocksStorage {
             Direction::OUT => CF_EDGES_OUT,
             Direction::IN => CF_EDGES_IN,
         };
-        let cf = self.db.cf_handle(cf_name).ok_or_else(|| StoreError::Other(format!("missing CF: {cf_name}")))?;
+        let cf = self.db.cf_handle(cf_name).ok_or(StoreError::MissingColumnFamily(cf_name))?;
         let mut batch = WriteBatchWithTransaction::<true>::default();
         for ev in edges {
             let cek = ev.canonical_key();
@@ -344,16 +334,16 @@ impl RocksStorage {
             let bytes = EdgeValue { property_blob: encode_props(&guard_props) }.encode().to_vec();
             batch.put_cf(&cf, key_bytes, &bytes);
         }
-        self.db.write(batch).map_err(|e| StoreError::Other(e.to_string()))
+        self.db.write(batch).map_err(StoreError::RocksDb)
     }
 
     pub(crate) fn delete_vertices(&mut self, keys: &[VertexKey]) -> Result<(), StoreError> {
-        let cf = self.db.cf_handle(CF_VERTICES).ok_or_else(|| StoreError::Other("missing CF: vertices".into()))?;
+        let cf = self.db.cf_handle(CF_VERTICES).ok_or(StoreError::MissingColumnFamily("vertices"))?;
         let mut batch = WriteBatchWithTransaction::<true>::default();
         for &key in keys {
             batch.delete_cf(&cf, encode_vertex_key(key));
         }
-        self.db.write(batch).map_err(|e| StoreError::Other(e.to_string()))
+        self.db.write(batch).map_err(StoreError::RocksDb)
     }
 
     pub(crate) fn delete_edges(&mut self, keys: &[CanonicalEdgeKey], direction: Direction) -> Result<(), StoreError> {
@@ -361,7 +351,7 @@ impl RocksStorage {
             Direction::OUT => CF_EDGES_OUT,
             Direction::IN => CF_EDGES_IN,
         };
-        let cf = self.db.cf_handle(cf_name).ok_or_else(|| StoreError::Other(format!("missing CF: {cf_name}")))?;
+        let cf = self.db.cf_handle(cf_name).ok_or(StoreError::MissingColumnFamily(cf_name))?;
         let mut batch = WriteBatchWithTransaction::<true>::default();
         for &key in keys {
             let key_bytes = match direction {
@@ -370,7 +360,7 @@ impl RocksStorage {
             };
             batch.delete_cf(&cf, key_bytes);
         }
-        self.db.write(batch).map_err(|e| StoreError::Other(e.to_string()))
+        self.db.write(batch).map_err(StoreError::RocksDb)
     }
 }
 

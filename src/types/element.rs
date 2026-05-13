@@ -28,7 +28,7 @@ use std::sync::RwLock;
 pub struct Vertex {
     pub id: VertexKey,
     pub label_id: LabelId,
-    pub props: RwLock<Vec<Property>>, // Mutated via lock, while counters use atomic interior mutability
+    pub props: RwLock<Vec<Property>>,
 }
 
 // ── Edge ──────────────────────────────────────────────────────────────────
@@ -38,14 +38,13 @@ pub struct Vertex {
 /// Always in canonical `Out` orientation.  The engine derives the directed
 /// `EdgeKey` from `canonical_key()` plus the direction it requested.
 ///
-/// TODO: haven't considered the property ordering implications of `Vec<Property>` yet.  If we need to support
 #[derive(Debug)]
 pub struct Edge {
     pub src_id: VertexKey,
     pub label_id: LabelId,
     pub rank: Rank,
     pub dst_id: VertexKey,
-    pub props: RwLock<Vec<Property>>, // Only this is mutable
+    pub props: RwLock<Vec<Property>>,
 }
 
 impl Edge {

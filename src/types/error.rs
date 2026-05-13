@@ -30,6 +30,18 @@ pub enum StoreError {
     LockError,
     DuplicateVertex(VertexKey),
     DuplicateEdge(CanonicalEdgeKey),
+    /// The element has already been deleted in this transaction's overlay.
+    Tombstoned,
+    /// A vertex cannot be deleted because it still has one or more incident edges.
+    IncidentEdges,
+    /// A stored byte sequence could not be decoded. The carried string names the
+    /// field that failed (e.g. `"vertex value"`, `"edge key"`).
+    CorruptData(&'static str),
+    /// A required RocksDB column-family handle was not found. Indicates a
+    /// database schema mismatch or misconfiguration.
+    MissingColumnFamily(&'static str),
+    /// An error returned directly by the RocksDB storage engine.
+    RocksDb(rocksdb::Error),
     Io(std::io::Error),
     Other(String),
 }
@@ -42,6 +54,11 @@ impl fmt::Display for StoreError {
             StoreError::LockError => write!(f, "lock error"),
             StoreError::DuplicateVertex(key) => write!(f, "duplicate vertex: {key}"),
             StoreError::DuplicateEdge(key) => write!(f, "duplicate edge: {key}"),
+            StoreError::Tombstoned => write!(f, "element is tombstoned"),
+            StoreError::IncidentEdges => write!(f, "cannot drop vertex with incident edges"),
+            StoreError::CorruptData(ctx) => write!(f, "corrupt data: {ctx}"),
+            StoreError::MissingColumnFamily(name) => write!(f, "missing column family: {name}"),
+            StoreError::RocksDb(e) => write!(f, "storage engine error: {e}"),
             StoreError::Io(e) => write!(f, "I/O error: {e}"),
             StoreError::Other(msg) => write!(f, "{msg}"),
         }
@@ -51,9 +68,16 @@ impl fmt::Display for StoreError {
 impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            StoreError::RocksDb(e) => Some(e),
             StoreError::Io(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+impl From<rocksdb::Error> for StoreError {
+    fn from(e: rocksdb::Error) -> Self {
+        StoreError::RocksDb(e)
     }
 }
 

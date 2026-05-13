@@ -33,10 +33,8 @@
 //! ```
 //!
 //! The engine never imports `GraphTransaction` or `GraphStore` directly —
-//! it only touches `GraphContext`.  Backend details (RocksDB CFs, OCC,
-//! encoding) never cross the `GraphTransaction` boundary.
-//! it only touches `LogicalGraph`. Backend details (RocksDB CFs, OCC, encoding) never cross the `GraphTransaction`
-//! boundary.
+//! it only touches `LogicalGraph`. Backend details (RocksDB CFs, OCC, encoding)
+//! never cross the `GraphTransaction` boundary.
 use std::sync::Arc;
 
 use crate::types::{gvalue::Property, CanonicalEdgeKey, Direction, Edge, LabelId, StoreError, Vertex, VertexKey};
@@ -49,8 +47,8 @@ use crate::types::{gvalue::Property, CanonicalEdgeKey, Direction, Edge, LabelId,
 ///
 /// # Read semantics
 ///
-/// Reads return `Arc<Full...>` so the engine can easily hold onto references.
-/// `GraphContext` stores the Arcs in its overlay; on mutation it acquires a write
+/// Reads return `Arc<Vertex>` or `Arc<Edge>` so the engine can hold references cheaply.
+/// `LogicalGraph` stores the Arcs in its overlay; on mutation it acquires a write
 /// lock on the properties `RwLock` for in-place updates.
 ///
 /// # Write semantics
@@ -59,7 +57,7 @@ use crate::types::{gvalue::Property, CanonicalEdgeKey, Direction, Edge, LabelId,
 /// and operates on individual records. It does not enforce graph consistency
 /// (e.g., maintaining matching Out and In edge records, updating vertex edge
 /// counts, or checking for dangling edges). That graph-level consistency is
-/// strictly the responsibility of `GraphContext`.
+/// strictly the responsibility of `LogicalGraph`.
 pub trait GraphTransaction {
     // ── Reads ─────────────────────────────────────────────────────────────────
 
@@ -74,9 +72,9 @@ pub trait GraphTransaction {
     //      inconvenient for strict existence checks. Needs further design consideration.
     fn get_vertex(&mut self, key: VertexKey) -> Result<Option<Arc<Vertex>>, StoreError>;
 
-    /// Fetch a committed vertex's edge counts; `None` if absent.
+    /// Fetch a committed vertex's out-degree and in-degree; `None` if absent.
     /// Implementations should register the key in an OCC read-set.
-    fn get_vertex_counts(&mut self, key: VertexKey) -> Result<Option<(u32, u32)>, StoreError>;
+    fn get_vertex_degree(&mut self, key: VertexKey) -> Result<Option<(u32, u32)>, StoreError>;
 
     /// Fetch a single committed edge record for the given direction; `None` if absent.
     fn get_edge(&mut self, key: CanonicalEdgeKey, direction: Direction) -> Result<Option<Arc<Edge>>, StoreError>;
@@ -98,8 +96,8 @@ pub trait GraphTransaction {
     /// Upsert a vertex record with explicit key, label, and full property list.
     fn put_vertex(&mut self, key: VertexKey, label_id: LabelId, props: &[Property]) -> Result<(), StoreError>;
 
-    /// Upsert only the vertex edge count record.
-    fn put_vertex_counts(&mut self, key: VertexKey, out_e_cnt: u32, in_e_cnt: u32) -> Result<(), StoreError>;
+    /// Upsert the vertex degree record (out-degree and in-degree).
+    fn put_vertex_degree(&mut self, key: VertexKey, out_e_cnt: u32, in_e_cnt: u32) -> Result<(), StoreError>;
 
     /// Upsert a single edge record in the specified physical direction index.
     fn put_edge(&mut self, key: CanonicalEdgeKey, direction: Direction, props: &[Property]) -> Result<(), StoreError>;
@@ -107,8 +105,8 @@ pub trait GraphTransaction {
     /// Delete a vertex metadata record.
     fn delete_vertex(&mut self, key: VertexKey) -> Result<(), StoreError>;
 
-    /// Delete the vertex edge count record.
-    fn delete_vertex_counts(&mut self, key: VertexKey) -> Result<(), StoreError>;
+    /// Delete the vertex degree record.
+    fn delete_vertex_degree(&mut self, key: VertexKey) -> Result<(), StoreError>;
 
     /// Delete a single edge record from the specified physical direction index.
     fn delete_edge(&mut self, key: CanonicalEdgeKey, direction: Direction) -> Result<(), StoreError>;
@@ -118,7 +116,7 @@ pub trait GraphTransaction {
     /// Flush all staged writes atomically.
     ///
     /// Returns `StoreError::Conflict` on OCC conflict; the caller must retry
-    /// the entire traversal from scratch with a new `GraphContext`.
+    /// the entire traversal from scratch with a new `LogicalGraph`.
     fn commit(&mut self) -> Result<(), StoreError>;
 
     /// Discard all staged writes and reset the transaction.

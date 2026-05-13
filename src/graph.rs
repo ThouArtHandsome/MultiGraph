@@ -26,10 +26,11 @@
 //!   │  ctx.commit()
 //!   ▼
 //! LogicalGraph<S: GraphStore>
-//!   vertices: HashMap<VertexKey, Arc<Vertex>>   ← query-scoped overlay
-//!   edges:    HashMap<CanonicalEdgeKey, Arc<Edge>>
-//!   dirty:    HashMap<CanonicalKey, Existence>
-//!   store:    S::Txn              ← flush-on-commit
+//!   vertices:      HashMap<VertexKey, Arc<Vertex>>    ← query-scoped overlay
+//!   edges:         HashMap<CanonicalEdgeKey, Arc<Edge>>
+//!   vertex_degree: HashMap<VertexKey, (u32, u32)>     ← degree tracking (out, in)
+//!   dirty:         HashMap<CanonicalKey, Existence>
+//!   store:         S::Txn                             ← flush-on-commit
 //!   ▼
 //! S::Txn: GraphTransaction         ← RocksDB / Distributed / Mock
 //! ```
@@ -128,7 +129,7 @@ pub struct LogicalGraph<S: GraphStore> {
     store: S::Txn,
     vertices: HashMap<VertexKey, Arc<Vertex>>,
     edges: HashMap<CanonicalEdgeKey, Arc<Edge>>,
-    vertex_counts: HashMap<VertexKey, (u32, u32)>,
+    vertex_degree: HashMap<VertexKey, (u32, u32)>,
     dirty: HashMap<CanonicalKey, Existence>,
 }
 
@@ -139,22 +140,22 @@ impl<S: GraphStore> LogicalGraph<S> {
             store,
             vertices: HashMap::new(),
             edges: HashMap::new(),
-            vertex_counts: HashMap::new(),
+            vertex_degree: HashMap::new(),
             dirty: HashMap::new(),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn get_vertex_counts_for_test(&mut self, key: VertexKey) -> Result<Option<(u32, u32)>, StoreError> {
-        self.get_vertex_counts(key)
+    pub(crate) fn get_vertex_degree_for_test(&mut self, key: VertexKey) -> Result<Option<(u32, u32)>, StoreError> {
+        self.get_vertex_degree(key)
     }
 
-    fn get_vertex_counts(&mut self, key: VertexKey) -> Result<Option<(u32, u32)>, StoreError> {
-        if let Some(counts) = self.vertex_counts.get(&key) {
+    fn get_vertex_degree(&mut self, key: VertexKey) -> Result<Option<(u32, u32)>, StoreError> {
+        if let Some(counts) = self.vertex_degree.get(&key) {
             return Ok(Some(*counts));
         }
-        self.store.get_vertex_counts(key)?.map_or(Ok(None), |counts| {
-            self.vertex_counts.insert(key, counts);
+        self.store.get_vertex_degree(key)?.map_or(Ok(None), |counts| {
+            self.vertex_degree.insert(key, counts);
             Ok(Some(counts))
         })
     }
@@ -263,14 +264,14 @@ impl<S: GraphStore> LogicalGraph<S> {
         if self.vertices.contains_key(&id) {
             return Err(StoreError::DuplicateVertex(id));
         }
-        // Use get_vertex_counts for a more efficient existence check.
-        if self.store.get_vertex_counts(id)?.is_some() {
+        // Use get_vertex_degree for a more efficient existence check.
+        if self.store.get_vertex_degree(id)?.is_some() {
             return Err(StoreError::DuplicateVertex(id));
         }
 
         let vertex = Arc::new(Vertex { id, label_id, props: RwLock::new(Vec::new()) });
         self.vertices.insert(id, vertex.clone());
-        self.vertex_counts.insert(id, (0, 0));
+        self.vertex_degree.insert(id, (0, 0));
         self.dirty.insert(CanonicalKey::Vertex(id), Existence::New);
         Ok((id, vertex))
     }
@@ -278,10 +279,7 @@ impl<S: GraphStore> LogicalGraph<S> {
     /// Register a new directed edge identified by `cek`.
     ///
     /// Returns `(EdgeKey, Arc<Edge>)` in Out orientation.
-    ///
-    /// # Panics (debug)
-    ///
-    /// Asserts the key is not already in the overlay.
+    /// Returns `StoreError::DuplicateEdge` if the key already exists in the overlay or store.
     pub fn add_edge(&mut self, cek: CanonicalEdgeKey) -> Result<(EdgeKey, Arc<Edge>), StoreError> {
         if self.edges.contains_key(&cek) {
             return Err(StoreError::DuplicateEdge(cek));
@@ -292,20 +290,16 @@ impl<S: GraphStore> LogicalGraph<S> {
         }
 
         // Ensure vertices exist and update their edge counters
-        let (mut src_out, src_in) = self
-            .get_vertex_counts(cek.src_id)?
-            .ok_or_else(|| StoreError::Other(format!("src vertex {} has been deleted", cek.src_id)))?;
-        let (dst_out, mut dst_in) = self
-            .get_vertex_counts(cek.dst_id)?
-            .ok_or_else(|| StoreError::Other(format!("dst vertex {} has been deleted", cek.dst_id)))?;
+        let (mut src_out, src_in) = self.get_vertex_degree(cek.src_id)?.ok_or(StoreError::NotFound)?;
+        let (dst_out, mut dst_in) = self.get_vertex_degree(cek.dst_id)?.ok_or(StoreError::NotFound)?;
 
         src_out += 1;
         dst_in += 1;
 
-        self.vertex_counts.insert(cek.src_id, (src_out, src_in));
+        self.vertex_degree.insert(cek.src_id, (src_out, src_in));
         self.mark_dirty(CanonicalKey::Vertex(cek.src_id), Existence::CounterOnly);
 
-        self.vertex_counts.insert(cek.dst_id, (dst_out, dst_in));
+        self.vertex_degree.insert(cek.dst_id, (dst_out, dst_in));
         self.mark_dirty(CanonicalKey::Vertex(cek.dst_id), Existence::CounterOnly);
 
         // 2. insert new edge into overlay and mark dirty.  The store is not touched until commit.
@@ -332,10 +326,10 @@ impl<S: GraphStore> LogicalGraph<S> {
         match key {
             CanonicalKey::Vertex(id) => {
                 if self.dirty.get(&key) == Some(&Existence::Tombstone) {
-                    return Err(StoreError::Other("element is tombstoned".into()));
+                    return Err(StoreError::Tombstoned);
                 }
                 match self.vertices.get_mut(&id) {
-                    None => return Err(StoreError::Other(format!("vertex {id} not exist"))),
+                    None => return Err(StoreError::NotFound),
                     Some(arc) => {
                         // 1. Acquire a write lock on the properties
                         let mut props = arc.props.write().map_err(|_| StoreError::LockError)?;
@@ -349,10 +343,10 @@ impl<S: GraphStore> LogicalGraph<S> {
             }
             CanonicalKey::Edge(cek) => {
                 if self.dirty.get(&key) == Some(&Existence::Tombstone) {
-                    return Err(StoreError::Other("element is tombstoned".into()));
+                    return Err(StoreError::Tombstoned);
                 }
                 match self.edges.get_mut(&cek) {
-                    None => return Err(StoreError::Other("edge not loaded".into())),
+                    None => return Err(StoreError::NotFound),
                     Some(arc) => {
                         let mut props = arc.props.write().map_err(|_| StoreError::LockError)?;
                         upsert_prop(&mut props, key, prop, value);
@@ -369,10 +363,10 @@ impl<S: GraphStore> LogicalGraph<S> {
         match key {
             CanonicalKey::Vertex(id) => {
                 if self.dirty.get(&key) == Some(&Existence::Tombstone) {
-                    return Err(StoreError::Other("element is tombstoned".into()));
+                    return Err(StoreError::Tombstoned);
                 }
                 match self.vertices.get_mut(&id) {
-                    None => return Err(StoreError::Other(format!("vertex {id} not loaded"))),
+                    None => return Err(StoreError::NotFound),
                     Some(arc) => {
                         let mut props = arc.props.write().map_err(|_| StoreError::LockError)?;
                         props.retain(|p| &p.key != prop);
@@ -382,10 +376,10 @@ impl<S: GraphStore> LogicalGraph<S> {
             }
             CanonicalKey::Edge(cek) => {
                 if self.dirty.get(&key) == Some(&Existence::Tombstone) {
-                    return Err(StoreError::Other("element is tombstoned".into()));
+                    return Err(StoreError::Tombstoned);
                 }
                 match self.edges.get_mut(&cek) {
-                    None => return Err(StoreError::Other("edge not loaded".into())),
+                    None => return Err(StoreError::NotFound),
                     Some(arc) => {
                         let mut props = arc.props.write().map_err(|_| StoreError::LockError)?;
                         props.retain(|p| &p.key != prop);
@@ -404,28 +398,26 @@ impl<S: GraphStore> LogicalGraph<S> {
     pub fn drop_element(&mut self, key: CanonicalKey) -> Result<(), StoreError> {
         match key {
             CanonicalKey::Vertex(id) => {
-                let (out_e, in_e) = self
-                    .get_vertex_counts(id)?
-                    .ok_or_else(|| StoreError::Other(format!("vertex {id} has been deleted")))?;
+                let (out_e, in_e) = self.get_vertex_degree(id)?.ok_or(StoreError::NotFound)?;
                 if out_e > 0 || in_e > 0 {
-                    return Err(StoreError::Other("cannot drop vertex with incident edges".into()));
+                    return Err(StoreError::IncidentEdges);
                 }
                 self.dirty.insert(key, Existence::Tombstone);
             }
             CanonicalKey::Edge(cek) => {
                 if !self.edges.contains_key(&cek) {
-                    return Err(StoreError::Other("edge not loaded".into()));
+                    return Err(StoreError::NotFound);
                 }
                 if self.dirty.get(&key) != Some(&Existence::Tombstone) {
                     self.dirty.insert(key, Existence::Tombstone);
-                    if let Some((mut out_e, in_e)) = self.get_vertex_counts(cek.src_id)? {
+                    if let Some((mut out_e, in_e)) = self.get_vertex_degree(cek.src_id)? {
                         out_e = out_e.saturating_sub(1);
-                        self.vertex_counts.insert(cek.src_id, (out_e, in_e));
+                        self.vertex_degree.insert(cek.src_id, (out_e, in_e));
                         self.mark_dirty(CanonicalKey::Vertex(cek.src_id), Existence::CounterOnly);
                     }
-                    if let Some((out_e, mut in_e)) = self.get_vertex_counts(cek.dst_id)? {
+                    if let Some((out_e, mut in_e)) = self.get_vertex_degree(cek.dst_id)? {
                         in_e = in_e.saturating_sub(1);
-                        self.vertex_counts.insert(cek.dst_id, (out_e, in_e));
+                        self.vertex_degree.insert(cek.dst_id, (out_e, in_e));
                         self.mark_dirty(CanonicalKey::Vertex(cek.dst_id), Existence::CounterOnly);
                     }
                 }
@@ -450,8 +442,8 @@ impl<S: GraphStore> LogicalGraph<S> {
                     let v = self.vertices.get(&id).expect("dirty vertex key not in vertices");
                     let props_guard = v.props.read().map_err(|_| StoreError::LockError)?;
                     self.store.put_vertex(id, v.label_id, &props_guard)?;
-                    let (out_e, in_e) = self.vertex_counts[&id];
-                    self.store.put_vertex_counts(id, out_e, in_e)?;
+                    let (out_e, in_e) = self.vertex_degree[&id];
+                    self.store.put_vertex_degree(id, out_e, in_e)?;
                 }
                 (CanonicalKey::Vertex(id), Existence::Modified) => {
                     let v = self.vertices.get(&id).expect("dirty vertex key not in vertices");
@@ -459,19 +451,19 @@ impl<S: GraphStore> LogicalGraph<S> {
                     self.store.put_vertex(id, v.label_id, &props_guard)?;
                 }
                 (CanonicalKey::Vertex(id), Existence::CounterOnly) => {
-                    let (out_e, in_e) = self.vertex_counts[&id];
-                    self.store.put_vertex_counts(id, out_e, in_e)?;
+                    let (out_e, in_e) = self.vertex_degree[&id];
+                    self.store.put_vertex_degree(id, out_e, in_e)?;
                 }
                 (CanonicalKey::Vertex(id), Existence::ModifiedWithCounter) => {
                     let v = self.vertices.get(&id).expect("dirty vertex key not in vertices");
                     let props_guard = v.props.read().map_err(|_| StoreError::LockError)?;
                     self.store.put_vertex(id, v.label_id, &props_guard)?;
-                    let (out_e, in_e) = self.vertex_counts[&id];
-                    self.store.put_vertex_counts(id, out_e, in_e)?;
+                    let (out_e, in_e) = self.vertex_degree[&id];
+                    self.store.put_vertex_degree(id, out_e, in_e)?;
                 }
                 (CanonicalKey::Vertex(id), Existence::Tombstone) => {
                     self.store.delete_vertex(id)?;
-                    self.store.delete_vertex_counts(id)?;
+                    self.store.delete_vertex_degree(id)?;
                 }
                 (
                     CanonicalKey::Edge(cek),
@@ -503,7 +495,7 @@ impl<S: GraphStore> LogicalGraph<S> {
         self.dirty.clear();
         self.vertices.clear();
         self.edges.clear();
-        self.vertex_counts.clear();
+        self.vertex_degree.clear();
     }
 }
 
@@ -2045,7 +2037,7 @@ mod tests {
         assert_eq!(out.len(), 4);
 
         // check vertex counter is correct after multiple contexts
-        let (out_e, in_e) = c.get_vertex_counts_for_test(hub).unwrap().unwrap();
+        let (out_e, in_e) = c.get_vertex_degree_for_test(hub).unwrap().unwrap();
         assert_eq!(out_e, 4);
         assert_eq!(in_e, 0);
 
@@ -2121,21 +2113,21 @@ mod tests {
         assert_eq!(alice_idx.label_id, 1);
         assert_eq!(prop(&alice_idx, "name"), Some(Primitive::String(SmolStr::new("Alice"))));
         assert_eq!(prop(&alice_idx, "age"), Some(Primitive::Int32(30)));
-        let (alice_out_e, alice_in_e) = c.get_vertex_counts_for_test(alice).unwrap().unwrap();
+        let (alice_out_e, alice_in_e) = c.get_vertex_degree_for_test(alice).unwrap().unwrap();
         assert_eq!(alice_out_e, 1);
         assert_eq!(alice_in_e, 0);
 
         let bob_idx = c.get_vertex(bob).unwrap().unwrap();
         assert_eq!(bob_idx.label_id, 1);
         assert_eq!(prop(&bob_idx, "name"), Some(Primitive::String(SmolStr::new("Bob"))));
-        let (bob_out_e, bob_in_e) = c.get_vertex_counts_for_test(bob).unwrap().unwrap();
+        let (bob_out_e, bob_in_e) = c.get_vertex_degree_for_test(bob).unwrap().unwrap();
         assert_eq!(bob_out_e, 1);
         assert_eq!(bob_in_e, 0);
 
         let london_idx = c.get_vertex(london).unwrap().unwrap();
         assert_eq!(london_idx.label_id, 2);
         assert_eq!(prop(&london_idx, "name"), Some(Primitive::String(SmolStr::new("London"))));
-        let (london_out_e, london_in_e) = c.get_vertex_counts_for_test(london).unwrap().unwrap();
+        let (london_out_e, london_in_e) = c.get_vertex_degree_for_test(london).unwrap().unwrap();
         assert_eq!(london_out_e, 0);
         assert_eq!(london_in_e, 2);
 
@@ -2154,15 +2146,38 @@ mod tests {
         assert_eq!(src_ids, vec![alice.min(bob), alice.max(bob)]);
     }
 
-    // -- Runnint time get_vertex_counts fails if vertex doesn't exist, so this tests that the vertex still exists after multiple contexts mutate it.
+    // Tests that operations depending on vertex counters (like adding an edge or dropping the vertex)
+    // fail gracefully when the vertex is deleted by a concurrent transaction.
     #[test]
-    fn get_vertex_get_counters_failed() {
-        // step 1, insert a vertex and set properties, commit the context txn1
+    fn concurrent_vertex_deletion_fails_dependent_operations() {
+        let (store, _dir) = open();
 
-        // step 2, in a new context txn2, get_vertex
+        // step 1, insert a vertex and set properties, commit the transaction txn1
+        let mut txn1 = ctx(&store);
+        let (v1, _) = txn1.add_vertex(1, 1).unwrap();
+        txn1.set_property(CanonicalKey::Vertex(v1), SmolStr::new("name"), Primitive::String(SmolStr::new("Alice")))
+            .unwrap();
+        txn1.commit().unwrap();
 
-        // step 3, the vertex was deleted in another context, commit the deleting context which should succeed
+        // step 2, in a new Transaction txn2, get_vertex
+        let mut txn2 = ctx(&store);
+        assert!(txn2.get_vertex(v1).unwrap().is_some());
 
-        // step 4, get_counter in txn2 should fail, but get_vertex should succeed and return the vertex with zero counters
+        // step 3, the vertex was deleted in another transaction, commit the deleting transaction which should succeed
+        let mut txn3 = ctx(&store);
+        txn3.drop_element(CanonicalKey::Vertex(v1)).unwrap();
+        txn3.commit().unwrap();
+
+        // As a result, adding an edge in txn2 using the deleted vertex should gracefully error out
+        let err = txn2.add_edge(cek(v1, 5, 2));
+        assert!(matches!(err, Err(StoreError::NotFound)));
+
+        // As a result, dropping the deleted vertex in txn2 should gracefully error out
+        let err = txn2.drop_element(CanonicalKey::Vertex(v1));
+        assert!(matches!(err, Err(StoreError::NotFound)));
+
+        // step 4, check that get_vertex in txn2 now returns None for the deleted vertex
+        let counts = txn2.get_vertex_degree_for_test(v1).unwrap();
+        assert!(counts.is_none());
     }
 }
