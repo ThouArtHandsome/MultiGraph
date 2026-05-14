@@ -24,7 +24,7 @@ pub struct GroupId {
 }
 
 impl GroupId {
-    fn new(root: u32) -> GroupId {
+    pub fn new(root: u32) -> GroupId {
         GroupId { path: smallvec![root] }
     }
 
