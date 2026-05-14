@@ -15,6 +15,7 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
+use crate::traversal::group_id::GroupId;
 use crate::types::GValue;
 
 /// The unit of work that flows between steps in a traversal pipeline.
@@ -32,15 +33,17 @@ use crate::types::GValue;
 pub struct Traverser {
     /// The current value carried by this traverser.
     pub value: GValue,
-    /// Labels assigned to the current step via `as(…)`.  `None` = no labels.
-    pub labels: Option<SmallVec<[SmolStr; 2]>>,
     /// Back-pointer to the spawning traverser — `Some` only when path tracking is active.
     pub parent: Option<Arc<Traverser>>,
+    // which group this traverser belongs to
+    pub group_id: GroupId,
+    /// Labels assigned to the current step via `as(…)`.  `None` = no labels.
+    pub labels: Option<SmallVec<[SmolStr; 2]>>,
 }
 
 impl Traverser {
     pub fn new(value: GValue) -> Self {
-        Self { value, labels: None, parent: None }
+        Self { value, labels: None, parent: None, group_id: GroupId::noop() }
     }
 
     /// Collect the full traversal history as `(value, labels)` pairs,

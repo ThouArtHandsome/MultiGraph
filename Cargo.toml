@@ -32,6 +32,9 @@
 
     # Bidirectional hash map — used by Schema for label_id ↔ label_string lookup
     bimap = "0.6"
+    # tokio tasks
+    tokio = { version = "1.52.3", features = ["sync", "rt", "macros"] }
+async-trait = "0.1.89"
 
 [dev-dependencies]
     tempfile = "3"

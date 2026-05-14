@@ -9,7 +9,3 @@
 // License, use of this software will be governed by the Apache License 2.0.
 //
 // SPDX-License-Identifier: BUSL-1.1
-
-// Path history is encoded directly in the Traverser linked list via
-// `Traverser::path: Option<Arc<Traverser>>`.  This module is reserved for
-// path-related utilities and the `path()` step implementation.

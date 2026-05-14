@@ -10,14 +10,15 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
-pub mod engine;
-pub mod group_id;
-pub mod iterators;
-pub mod message;
-pub mod pipeline;
-pub mod step;
-pub mod traverser;
+use crate::traversal::iterators::traits::{BroadcastIter, ConsumerIter, Step};
+use std::cell::RefCell;
+use std::rc::Rc;
 
-pub use group_id::GroupId;
-pub use traverser::Traverser;
-pub use {actors::*, message::*, step::*};
+pub struct WhereEnterStep;
+
+impl WhereEnterStep {
+    /// Returns a new BroadcastIter instance that can be dynamically subscribed to.
+    pub fn new() -> Rc<RefCell<BroadcastIter>> {
+        BroadcastIter::new()
+    }
+}
