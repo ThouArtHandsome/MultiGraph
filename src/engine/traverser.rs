@@ -32,7 +32,8 @@ pub struct Traverser {
     pub value: GValue,
     /// Back-pointer to the spawning traverser — `Some` only when path tracking is active.
     pub parent: Option<Arc<Traverser>>,
-    // which group this traverser belongs to
+    // which group this traverser belongs to, only used data_flow engine to track group membership for grouping and
+    // co-grouping steps
     pub group_id: GroupId,
     /// Labels assigned to the current step via `as(…)`.  `None` = no labels.
     pub labels: Option<SmallVec<[SmolStr; 2]>>,
