@@ -13,6 +13,8 @@
 use crate::types::{
     gvalue::Property,
     keys::{CanonicalEdgeKey, LabelId, Rank, VertexKey},
+    prop_key::PropKey,
+    Primitive,
 };
 use std::sync::RwLock;
 
@@ -31,13 +33,18 @@ pub struct Vertex {
     pub props: RwLock<Vec<Property>>,
 }
 
+impl Vertex {
+    pub fn get_property(&self, key: &PropKey) -> Option<Primitive> {
+        let props = self.props.read().unwrap();
+        props.iter().find(|p| p.key == *key).map(|p| p.value.clone())
+    }
+}
 // ── Edge ──────────────────────────────────────────────────────────────────
 
 /// The ground-truth edge record crossing the store ↔ context boundary.
 ///
 /// Always in canonical `Out` orientation.  The engine derives the directed
 /// `EdgeKey` from `canonical_key()` plus the direction it requested.
-///
 #[derive(Debug)]
 pub struct Edge {
     pub src_id: VertexKey,
@@ -51,6 +58,11 @@ impl Edge {
     /// Extract the direction-free canonical key (same as the `edges_out` CF key).
     pub fn canonical_key(&self) -> CanonicalEdgeKey {
         CanonicalEdgeKey { src_id: self.src_id, label_id: self.label_id, rank: self.rank, dst_id: self.dst_id }
+    }
+
+    pub fn get_property(&self, key: &PropKey) -> Option<Primitive> {
+        let props = self.props.read().unwrap();
+        props.iter().find(|p| p.key == *key).map(|p| p.value.clone())
     }
 }
 

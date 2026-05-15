@@ -48,10 +48,10 @@
 //!
 //! ```rust,ignore
 //! use std::{cell::RefCell, rc::Rc};
-//! use crate::traversal::{
+//! use crate::engine::data_flow::{
 //!     context::GraphCtx,
-//!     step::physical::traits::{BroadcastState, ConsumerIter, GremlinStep, HasBroadcast, Produce},
-//!     Traverser,
+//!     steps::traits::{BroadcastState, ConsumerIter, GremlinStep, HasBroadcast, Produce},
+//!     traverser::Traverser,
 //! };
 //!
 //! struct Inner {
@@ -130,12 +130,14 @@
 
 // ── Pull-based runtime steps ──────────────────────────────────────────────────
 pub mod has_property;
+pub mod in_e;
+pub mod in_v;
 pub mod out_e;
+pub mod out_v;
 pub mod scalar_filter;
 pub mod traits;
 pub mod union_enter;
 pub mod union_exit;
-pub mod v;
 pub mod vec_source;
 pub mod where_enter;
 pub mod where_exit;
@@ -149,25 +151,25 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::{
-        traversal::{
+        engine::{
             context::NoopCtx,
-            group_id::GroupId,
-            step::physical::{
-                scalar_filter::ScalarFilterStep,
-                traits::{GremlinStep, Step},
-                vec_source::VecSourceStep,
-                where_enter::WhereEnterStep,
-                where_exit::WhereExitStep,
+            data_flow::{
+                group_id::GroupId,
+                message::Message,
+                steps::{
+                    scalar_filter::ScalarFilterStep,
+                    traits::{GremlinStep, Step},
+                    vec_source::VecSourceStep,
+                    where_enter::WhereEnterStep,
+                    where_exit::WhereExitStep,
+                },
             },
-            traverser::Traverser,
         },
         types::{gvalue::Primitive, GValue},
     };
 
-    fn traverser(root_id: u32, value: i32) -> Traverser {
-        let mut t = Traverser::new(GValue::Scalar(Primitive::Int32(value)));
-        t.group_id = GroupId::new(root_id);
-        t
+    fn gvalue(value: i32) -> GValue {
+        GValue::Scalar(Primitive::Int32(value))
     }
 
     // ── Pipeline test ─────────────────────────────────────────────────────────
@@ -181,7 +183,7 @@ mod tests {
 
     #[test]
     fn where_filter_pipeline() {
-        let source = VecSourceStep::new(VecDeque::from([traverser(1, 1), traverser(2, 2), traverser(3, 3)]));
+        let source = VecSourceStep::new(VecDeque::from([gvalue(1), gvalue(2), gvalue(3)]));
         let source_consumer = VecSourceStep::subscribe(&source);
 
         let enter = WhereEnterStep::new();
@@ -198,10 +200,12 @@ mod tests {
         exit.add_upper(filter_consumer, "sub");
         let result = WhereExitStep::subscribe(&exit);
 
-        let ctx = NoopCtx;
+        let mut ctx = NoopCtx;
         let mut results = vec![];
-        while let Some(t) = result.next(&ctx) {
-            results.push(t);
+        while let Some(msg) = result.next(&mut ctx) {
+            if let Message::Traverser(t) = msg {
+                results.push(t);
+            }
         }
 
         assert_eq!(results.len(), 1, "only one traverser should pass the where filter");
@@ -210,6 +214,6 @@ mod tests {
             GValue::Scalar(Primitive::Int32(2)),
             "the passing traverser should carry value Int32(2)"
         );
-        assert_eq!(results[0].group_id, GroupId::new(2), "group_id must match");
+        assert_eq!(results[0].group_id, GroupId::new(1), "group_id must match");
     }
 }

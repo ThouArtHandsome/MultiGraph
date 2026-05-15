@@ -28,13 +28,13 @@ impl GroupId {
         GroupId { path: smallvec![root] }
     }
 
-    fn child(&self, child_id: u32) -> GroupId {
+    pub fn child(&self, child_id: u32) -> GroupId {
         let mut path = self.path.clone();
         path.push(child_id);
         GroupId { path }
     }
 
-    fn parent(&self) -> Option<GroupId> {
+    pub fn parent(&self) -> Option<GroupId> {
         if self.path.len() <= 1 {
             return None;
         }
@@ -43,11 +43,11 @@ impl GroupId {
         Some(GroupId { path })
     }
 
-    fn depth(&self) -> usize {
+    pub fn depth(&self) -> usize {
         self.path.len()
     }
 
-    fn inner_id(&self) -> u32 {
+    pub fn inner_id(&self) -> u32 {
         *self.path.last().unwrap()
     }
 

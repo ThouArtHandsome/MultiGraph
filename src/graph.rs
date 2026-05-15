@@ -74,7 +74,6 @@ use std::{
 
 use crate::{
     store::traits::{GraphStore, GraphTransaction},
-    traversal::context::GraphCtx,
     types::{
         element::{Edge, Vertex},
         gvalue::{Primitive, Property},
@@ -499,8 +498,6 @@ impl<S: GraphStore> LogicalGraph<S> {
         self.vertex_degree.clear();
     }
 }
-
-impl<S: GraphStore> GraphCtx for LogicalGraph<S> {}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

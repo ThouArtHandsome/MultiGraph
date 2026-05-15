@@ -10,9 +10,9 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
+use crate::engine::{context::GraphCtx, data_flow::message::Message};
+use smallvec::SmallVec;
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
-
-use crate::traversal::{context::GraphCtx, Traverser};
 
 // ── ConsumerId ────────────────────────────────────────────────────────────────
 
@@ -32,7 +32,7 @@ pub struct ConsumerId(pub(crate) usize);
 /// produced items.  Items are evicted from the front of the buffer once every
 /// registered consumer has passed them, keeping memory bounded.
 pub(crate) struct BroadcastState {
-    buffer: VecDeque<Traverser>,
+    buffer: VecDeque<Message>,
     cursors: Vec<usize>,
 }
 
@@ -55,13 +55,13 @@ impl BroadcastState {
     }
 
     /// Append one or more items to the back of the buffer.
-    pub(crate) fn push(&mut self, items: Vec<Traverser>) {
+    pub(crate) fn push(&mut self, items: SmallVec<[Message; 4]>) {
         self.buffer.extend(items);
     }
 
     /// Return the next buffered item for consumer `id`, advance its cursor,
     /// and evict any items all consumers have already passed.
-    pub(crate) fn advance(&mut self, id: ConsumerId) -> Option<Traverser> {
+    pub(crate) fn advance(&mut self, id: ConsumerId) -> Option<Message> {
         let pos = self.cursors[id.0];
         if pos >= self.buffer.len() {
             return None;
@@ -93,7 +93,7 @@ pub(crate) trait HasBroadcast {
 /// Return `None` to signal that the source is exhausted.  The blanket impl
 /// propagates that `None` directly to the caller without touching the buffer.
 pub(crate) trait Produce {
-    fn produce(&self, ctx: &dyn GraphCtx) -> Option<Vec<Traverser>>;
+    fn produce(&self, ctx: &mut dyn GraphCtx) -> Option<SmallVec<[Message; 4]>>;
 }
 
 // ── Pullable ──────────────────────────────────────────────────────────────────
@@ -105,12 +105,12 @@ pub(crate) trait Produce {
 /// the `needs_more` / `push` / `advance` pattern uniformly.  `Rc<dyn Pullable>`
 /// requires `&self` (not `&mut self`), so interior mutability via `RefCell` is used.
 pub(crate) trait Pullable {
-    fn pull(&self, id: ConsumerId, ctx: &dyn GraphCtx) -> Option<Traverser>;
+    fn pull(&self, id: ConsumerId, ctx: &mut dyn GraphCtx) -> Option<Message>;
     fn register(&self) -> ConsumerId;
 }
 
 impl<T: HasBroadcast + Produce> Pullable for T {
-    fn pull(&self, id: ConsumerId, ctx: &dyn GraphCtx) -> Option<Traverser> {
+    fn pull(&self, id: ConsumerId, ctx: &mut dyn GraphCtx) -> Option<Message> {
         // Bind to a local so the immutable borrow is dropped before borrow_mut below.
         let needs_more = self.broadcast().borrow().needs_more(id);
         if needs_more {
@@ -146,7 +146,7 @@ impl ConsumerIter {
         Self { source, id }
     }
 
-    pub fn next(&self, ctx: &dyn GraphCtx) -> Option<Traverser> {
+    pub fn next(&self, ctx: &mut dyn GraphCtx) -> Option<Message> {
         self.source.pull(self.id, ctx)
     }
 }

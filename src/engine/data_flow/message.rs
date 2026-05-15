@@ -10,25 +10,23 @@
 //
 // SPDX-License-Identifier: BUSL-1.1
 
-use crate::traversal::{GroupId, Traverser};
-use tokio::sync::broadcast;
+use crate::engine::{data_flow::group_id::GroupId, traverser::Traverser};
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Traverser(Traverser),
     GroupBegin(GroupId), // start of a new group
     GroupEnd(GroupId),   // end of a group
-    Flush,               // no more data
-    Abort,               // cancel
+    Cancel,              // cancel
 }
-
-pub type OutboundHub = broadcast::Sender<Message>;
-pub type InboundHub = broadcast::Receiver<Message>;
 
 /// Describes the semantic role of a connection
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Descriptor {
     Primary,
     Secondary,
+    Third,
+    Fourth,
+    Fifth,
     Other(String), // for future extension
 }

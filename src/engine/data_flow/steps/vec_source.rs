@@ -12,10 +12,19 @@
 
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
-use crate::traversal::{
-    context::GraphCtx,
-    step::physical::traits::{BroadcastState, ConsumerId, ConsumerIter, HasBroadcast, Produce, Pullable},
-    Traverser,
+use smallvec::{smallvec, SmallVec};
+
+use crate::{
+    engine::{
+        context::GraphCtx,
+        data_flow::{
+            group_id::GroupId,
+            message::Message,
+            steps::traits::{BroadcastState, ConsumerIter, HasBroadcast, Produce, Pullable},
+        },
+        traverser::Traverser,
+    },
+    types::GValue,
 };
 
 struct Inner {
@@ -28,8 +37,21 @@ pub struct VecSourceStep {
 }
 
 impl VecSourceStep {
-    pub fn new(items: VecDeque<Traverser>) -> Rc<Self> {
-        Rc::new(Self { broadcast: RefCell::new(BroadcastState::new()), inner: RefCell::new(Inner { items }) })
+    pub fn new(items: VecDeque<GValue>) -> Rc<Self> {
+        let traversers: VecDeque<Traverser> = items
+            .into_iter()
+            .enumerate()
+            .map(|(i, val)| {
+                let mut t = Traverser::new(val);
+                t.group_id = GroupId::new(i as u32);
+                t
+            })
+            .collect();
+
+        Rc::new(Self {
+            broadcast: RefCell::new(BroadcastState::new()),
+            inner: RefCell::new(Inner { items: traversers }),
+        })
     }
 
     pub fn subscribe(rc: &Rc<Self>) -> ConsumerIter {
@@ -44,8 +66,8 @@ impl HasBroadcast for VecSourceStep {
 }
 
 impl Produce for VecSourceStep {
-    fn produce(&self, _ctx: &dyn GraphCtx) -> Option<Vec<Traverser>> {
+    fn produce(&self, _ctx: &mut dyn GraphCtx) -> Option<SmallVec<[Message; 4]>> {
         let item = self.inner.borrow_mut().items.pop_front()?;
-        Some(vec![item])
+        Some(smallvec![Message::Traverser(item)])
     }
 }

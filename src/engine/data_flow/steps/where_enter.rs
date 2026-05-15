@@ -12,10 +12,14 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use crate::traversal::{
+use smallvec::{smallvec, SmallVec};
+
+use crate::engine::{
     context::GraphCtx,
-    step::physical::traits::{BroadcastState, ConsumerIter, GremlinStep, HasBroadcast, Produce},
-    Traverser,
+    data_flow::{
+        message::Message,
+        steps::traits::{BroadcastState, ConsumerIter, GremlinStep, HasBroadcast, Produce},
+    },
 };
 
 struct Inner {
@@ -42,10 +46,10 @@ impl HasBroadcast for WhereEnterStep {
 }
 
 impl Produce for WhereEnterStep {
-    fn produce(&self, ctx: &dyn GraphCtx) -> Option<Vec<Traverser>> {
+    fn produce(&self, ctx: &mut dyn GraphCtx) -> Option<SmallVec<[Message; 4]>> {
         let inner = self.inner.borrow();
         let item = inner.upstream.as_ref()?.next(ctx)?;
-        Some(vec![item])
+        Some(smallvec![item])
     }
 }
 

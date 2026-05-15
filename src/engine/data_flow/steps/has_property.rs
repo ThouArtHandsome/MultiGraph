@@ -12,11 +12,15 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use smallvec::{smallvec, SmallVec};
+
 use crate::{
-    traversal::{
+    engine::{
         context::GraphCtx,
-        step::physical::traits::{BroadcastState, ConsumerIter, GremlinStep, HasBroadcast, Produce},
-        Traverser,
+        data_flow::{
+            message::Message,
+            steps::traits::{BroadcastState, ConsumerIter, GremlinStep, HasBroadcast, Produce},
+        },
     },
     types::{gvalue::Primitive, prop_key::PropKey},
 };
@@ -48,11 +52,33 @@ impl HasBroadcast for HasPropertyStep {
 }
 
 impl Produce for HasPropertyStep {
-    fn produce(&self, ctx: &dyn GraphCtx) -> Option<Vec<Traverser>> {
+    fn produce(&self, ctx: &mut dyn GraphCtx) -> Option<SmallVec<[Message; 4]>> {
         let inner = self.inner.borrow();
-        // filter by property value via ctx here; stub passes through
-        let item = inner.upstream.as_ref().unwrap().next(ctx)?;
-        Some(vec![item])
+        loop {
+            let item = inner.upstream.as_ref().unwrap().next(ctx)?;
+            if let Message::Traverser(t) = &item {
+                match &t.value {
+                    crate::types::gvalue::GValue::Vertex(vk) => {
+                        if let Some(vt) = ctx.get_vertex(*vk).unwrap() {
+                            if vt.get_property(&inner.prop_key) == Some(inner.expected_value.clone()) {
+                                return Some(smallvec![item]);
+                            }
+                        }
+                    }
+                    crate::types::gvalue::GValue::Edge(ek) => {
+                        if let Some(et) = ctx.get_edge(*ek).unwrap() {
+                            if et.get_property(&inner.prop_key) == Some(inner.expected_value.clone()) {
+                                return Some(smallvec![item]);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                // Always pass control messages (GroupBegin, Cancel, etc.) through
+                return Some(smallvec![item]);
+            }
+        }
     }
 }
 

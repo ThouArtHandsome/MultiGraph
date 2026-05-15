@@ -12,12 +12,18 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use crate::traversal::{
-    context::GraphCtx,
-    step::physical::traits::{BroadcastState, ConsumerIter, GremlinStep, HasBroadcast, Produce},
-    Traverser,
+use smallvec::{smallvec, SmallVec};
+
+use crate::{
+    engine::{
+        context::GraphCtx,
+        data_flow::{
+            message::Message,
+            steps::traits::{BroadcastState, ConsumerIter, GremlinStep, HasBroadcast, Produce},
+        },
+    },
+    types::{GValue, Primitive},
 };
-use crate::types::{gvalue::Primitive, GValue};
 
 struct Inner {
     upstream: Option<ConsumerIter>,
@@ -45,12 +51,16 @@ impl HasBroadcast for ScalarFilterStep {
 }
 
 impl Produce for ScalarFilterStep {
-    fn produce(&self, ctx: &dyn GraphCtx) -> Option<Vec<Traverser>> {
+    fn produce(&self, ctx: &mut dyn GraphCtx) -> Option<SmallVec<[Message; 4]>> {
         let inner = self.inner.borrow();
         loop {
-            let t = inner.upstream.as_ref().unwrap().next(ctx)?;
-            if matches!(&t.value, GValue::Scalar(p) if p == &inner.expected) {
-                return Some(vec![t]);
+            let item = inner.upstream.as_ref().unwrap().next(ctx)?;
+            if let Message::Traverser(t) = &item {
+                if matches!(&t.value, GValue::Scalar(p) if p == &inner.expected) {
+                    return Some(smallvec![item]);
+                }
+            } else {
+                return Some(smallvec![item]);
             }
         }
     }
